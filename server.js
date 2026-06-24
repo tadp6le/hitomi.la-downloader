@@ -9,7 +9,6 @@ const archiver = require('archiver');
 const { EventEmitter } = require('events');
 const winston = require('winston');
 const NodeCache = require('node-cache');
-const crypto = require('crypto');
 
 // --------------- Configuration ---------------
 const PORT = process.env.PORT || 10000;
@@ -221,12 +220,13 @@ class HitomiGallery {
     }
   }
 
-  // --- NEW: Fetch and parse gg.js to get image URL generation parameters ---
-  async fetchGgJs(session) {
+  // --- NEW: Parse the obfuscated gg.js ---
+  async fetchAndParseGg(session) {
     const domains = [
       'ltn.gold-usergeneratedcontent.net',
       'ltn.hitomi.la',
     ];
+    let ggContent = null;
     for (const domain of domains) {
       const url = `https://${domain}/gg.js`;
       try {
@@ -234,75 +234,136 @@ class HitomiGallery {
         const response = await session.get(url, { timeout: 10000 });
         if (response.status === 200) {
           log('info', `✅ Successfully fetched gg.js from ${url}`);
-          return response.data;
+          ggContent = response.data;
+          break;
         }
       } catch (err) {
         // ignore
       }
     }
-    throw new Error('Could not fetch gg.js from any domain.');
-  }
-
-  parseGgJs(jsContent) {
-    // Extract the array from: var GG = [...];
-    const match = jsContent.match(/var\s+GG\s*=\s*(\[[\s\S]*?\]);/);
-    if (!match) {
-      throw new Error('Could not find GG array in gg.js');
+    if (!ggContent) {
+      throw new Error('Could not fetch gg.js from any domain.');
     }
-    try {
-      // Clean up the array string (remove comments, trailing commas)
-      const cleaned = match[1]
-        .replace(/\/\/.*$/gm, '')
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/,\s*\]/g, ']');
-      const ggArray = JSON.parse(cleaned);
-      if (!Array.isArray(ggArray) || ggArray.length < 2) {
-        throw new Error('GG array is invalid');
+
+    // Parse the gg object from the script
+    // The script contains: 'use strict'; gg = { m: function(g) { ... } };
+    // We need to extract the mapping of gallery IDs to multipliers
+    
+    // First, find the gg object declaration
+    const ggMatch = ggContent.match(/gg\s*=\s*(\{[\s\S]*?\});/);
+    if (!ggMatch) {
+      throw new Error('Could not find gg object in gg.js');
+    }
+
+    // Now parse the m function to extract the case statements
+    // The function looks like: m: function(g) { var o = 1; switch (g) { case 4069: case 2119: ... case 123: o = X; break; ... } return o; }
+    const mFuncMatch = ggMatch[1].match(/m\s*:\s*function\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
+    if (!mFuncMatch) {
+      throw new Error('Could not find m function in gg object');
+    }
+
+    const mFuncBody = mFuncMatch[1];
+    
+    // Extract the switch statement
+    const switchMatch = mFuncBody.match(/switch\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
+    if (!switchMatch) {
+      throw new Error('Could not find switch statement in m function');
+    }
+
+    const switchBody = switchMatch[1];
+    
+    // Parse case statements to build a mapping
+    // Format: case 4069: case 2119: ... case 123: o = X; break;
+    // We need to find all case groups and their corresponding o = X assignments
+    
+    // Split by "break;" to separate each case group
+    const caseGroups = switchBody.split(/break\s*;/);
+    
+    const multiplierMap = {};
+    
+    for (const group of caseGroups) {
+      // Find all case values in this group
+      const caseMatches = group.match(/case\s+(\d+)\s*:/g);
+      if (!caseMatches) continue;
+      
+      // Extract the o = X assignment
+      const oMatch = group.match(/o\s*=\s*(\d+)\s*;/);
+      if (!oMatch) continue;
+      
+      const multiplier = parseInt(oMatch[1], 10);
+      
+      // For each case value, map it to the multiplier
+      for (const caseMatch of caseMatches) {
+        const caseValue = parseInt(caseMatch.match(/\d+/)[0], 10);
+        multiplierMap[caseValue] = multiplier;
       }
-      // GG format: [multiplier, index, default_domain?]
-      // Based on gallery-dl implementation: https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/hitomi.py
-      const multiplier = ggArray[0];
-      const index = ggArray[1];
-      // The third element is the default domain (optional)
-      const defaultDomain = ggArray.length > 2 ? ggArray[2] : null;
-      log('info', `Parsed GG: multiplier=${multiplier}, index=${index}, defaultDomain=${defaultDomain}`);
-      return { multiplier, index, defaultDomain };
-    } catch (e) {
-      log('error', `Failed to parse GG array: ${e.message}`);
-      throw new Error('Failed to parse gg.js');
     }
+
+    if (Object.keys(multiplierMap).length === 0) {
+      throw new Error('No case statements found in gg.js');
+    }
+
+    log('info', `Parsed ${Object.keys(multiplierMap).length} gallery ID mappings from gg.js`);
+    
+    // Also extract the default domain if present (the 'a' value at the end)
+    // The gg object may have additional properties
+    const defaultMatch = ggMatch[1].match(/,\s*(\d+)\s*\]?\s*$/);
+    let defaultDomain = null;
+    if (defaultMatch) {
+      // The last number might be the default subdomain index
+      const idx = parseInt(defaultMatch[1], 10);
+      const subdomains = 'abcdefghijklmnopqrstuvwxyz';
+      defaultDomain = subdomains[idx % subdomains.length] + '.hitomi.la';
+      log('info', `Found default domain: ${defaultDomain}`);
+    }
+
+    return { multiplierMap, defaultDomain };
   }
 
-  // --- NEW: Generate the correct image URL using the algorithm from gg.js ---
-  generateImageUrl(galleryId, image, ggParams) {
-    // The algorithm is based on the gallery-dl implementation:
-    // https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/hitomi.py
-    const { multiplier, index, defaultDomain } = ggParams;
+  // --- Generate the correct image URL using the gg.js mapping ---
+  generateImageUrl(galleryId, image, ggData) {
+    const { multiplierMap, defaultDomain } = ggData;
+    
+    // Get the multiplier for this gallery ID
+    const multiplier = multiplierMap[parseInt(galleryId, 10)];
+    if (!multiplier) {
+      log('warn', `No multiplier found for gallery ${galleryId}, using fallback`);
+      // Fallback: try to use the first available multiplier
+      const firstKey = Object.keys(multiplierMap)[0];
+      // Use the multiplier from the first mapping as a fallback
+      const fallbackMultiplier = multiplierMap[firstKey] || 1;
+      // Generate URL using the fallback
+      return this.generateUrlWithMultiplier(galleryId, image, fallbackMultiplier, defaultDomain);
+    }
+    
+    return this.generateUrlWithMultiplier(galleryId, image, multiplier, defaultDomain);
+  }
+
+  generateUrlWithMultiplier(galleryId, image, multiplier, defaultDomain) {
     const hash = image.hash;
     const name = image.name;
-
-    // Calculate the subdomain
-    // The hash is a hex string, we need to convert it to a number
+    
+    // Calculate subdomain index using the algorithm from gallery-dl
+    // https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/hitomi.py
+    // The hash is a hex string, convert to BigInt
     const hashNum = BigInt('0x' + hash);
-    // The algorithm: (hashNum / multiplier) % index
-    // But we need to handle the division carefully
-    const subdomainIndex = Number((hashNum / BigInt(multiplier)) % BigInt(index));
+    // (hash / multiplier) % 26
+    const subdomainIndex = Number((hashNum / BigInt(multiplier)) % BigInt(26));
     
-    // Map the index to a subdomain letter
-    // The subdomains are typically: a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z
-    // But we need to map the index to the correct letter
-    // Based on gallery-dl: subdomains = "abcdefghijklmnopqrstuvwxyz"
+    // Map to subdomain letter (a-z)
     const subdomains = 'abcdefghijklmnopqrstuvwxyz';
-    let subdomain = subdomains[subdomainIndex % subdomains.length] || 'a';
+    const subdomain = subdomains[subdomainIndex % subdomains.length];
     
-    // If there's a default domain, use it instead of the subdomain
-    let domain = defaultDomain || `${subdomain}.hitomi.la`;
+    // Use default domain if provided, otherwise construct with subdomain
+    let domain;
+    if (defaultDomain) {
+      domain = defaultDomain;
+    } else {
+      domain = `${subdomain}.hitomi.la`;
+    }
     
-    // Construct the URL
-    // Format: https://{subdomain}.hitomi.la/galleries/{galleryId}/{name}
-    // Or if defaultDomain is set: https://{defaultDomain}/galleries/{galleryId}/{name}
     const url = `https://${domain}/galleries/${galleryId}/${name}`;
-    log('info', `Generated image URL: ${url} (hash: ${hash.substring(0, 8)}..., subdomainIndex: ${subdomainIndex})`);
+    log('info', `Generated URL: ${url} (multiplier: ${multiplier}, subdomainIndex: ${subdomainIndex})`);
     return url;
   }
 
@@ -346,14 +407,12 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    // --- NEW: Fetch and parse gg.js ---
-    let ggJs;
-    let ggParams;
+    // --- Fetch and parse gg.js ---
+    let ggData;
     try {
-      ggJs = await this.fetchGgJs(session);
-      ggParams = this.parseGgJs(ggJs);
+      ggData = await this.fetchAndParseGg(session);
     } catch (err) {
-      log('error', `Failed to fetch/parse gg.js: ${err.message}`);
+      log('error', `Failed to parse gg.js: ${err.message}`);
       throw new Error(`Unable to load gg.js: ${err.message}`);
     }
 
@@ -390,11 +449,10 @@ class HitomiGallery {
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
-    // --- NEW: Generate image URLs using gg.js parameters ---
-    // We need to store the ggParams in the info so we can use them later for download
+    // Store images with their hashes for URL generation
     const images = files.map(file => ({
       name: file.name,
-      hash: file.hash, // IMPORTANT: we need the hash for URL generation
+      hash: file.hash,
       width: file.width || 0,
       height: file.height || 0,
       hasavif: file.hasavif || 0,
@@ -419,7 +477,7 @@ class HitomiGallery {
       formats,
       galleryId: this.galleryId,
       images,
-      ggParams, // Store ggParams for later use
+      ggData, // Store ggData for URL generation
     };
 
     cache.set(cacheKey, info);
@@ -428,12 +486,10 @@ class HitomiGallery {
   }
 }
 
-// Helper: construct image URL using the gg.js algorithm
-function constructImageUrl(galleryId, image, ggParams) {
-  // Use the gallery's generateImageUrl method
+// Helper: construct image URL using the gg.js data
+function constructImageUrl(galleryId, image, ggData) {
   const gallery = new HitomiGallery(`https://hitomi.la/galleries/${galleryId}.html`);
-  // We need to pass the ggParams and the image
-  return gallery.generateImageUrl(galleryId, image, ggParams);
+  return gallery.generateImageUrl(galleryId, image, ggData);
 }
 
 // --------------- API Routes ---------------
@@ -446,7 +502,7 @@ app.post('/api/gallery/info', async (req, res) => {
     const info = await gallery.getGalleryInfo();
 
     // Estimate total size
-    const { images, galleryId, ggParams } = info;
+    const { images, galleryId, ggData } = info;
     let totalSize = 0;
     const concurrency = 5;
     const total = images.length;
@@ -458,8 +514,7 @@ app.post('/api/gallery/info', async (req, res) => {
       while (queue.length) {
         const idx = queue.shift();
         const img = images[idx];
-        // Use the new URL generation
-        const url = constructImageUrl(galleryId, img, ggParams);
+        const url = constructImageUrl(galleryId, img, ggData);
         try {
           await antiBlock.executeWithRetry(async () => {
             const headRes = await session.head(url);
@@ -502,7 +557,7 @@ app.post('/api/gallery/download', async (req, res) => {
     const gallery = new HitomiGallery(url);
     const info = await gallery.getGalleryInfo();
     const downloadCount = Math.min(Math.max(1, parseInt(count, 10)), info.total);
-    const { images, galleryId, title, ggParams } = info;
+    const { images, galleryId, title, ggData } = info;
 
     log('info', `Starting ZIP creation for ${downloadCount} images from "${title}"`);
 
@@ -529,8 +584,7 @@ app.post('/api/gallery/download', async (req, res) => {
     for (let i = 0; i < downloadCount; i++) {
       if (aborted) break;
       const img = images[i];
-      // Use the new URL generation
-      const imgUrl = constructImageUrl(galleryId, img, ggParams);
+      const imgUrl = constructImageUrl(galleryId, img, ggData);
       const ext = img.name.split('.').pop();
       const filename = `${i+1}.${ext}`;
 
@@ -585,5 +639,5 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => {
   log('info', 'SIGTERM received, shutting down');
-  server.close(() => process.exit(0));
+  server.close(() => process.exit(0);
 });
