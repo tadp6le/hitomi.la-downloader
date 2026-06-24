@@ -15,6 +15,28 @@ const vm = require('vm');
 const PORT = process.env.PORT || 10000;
 const CACHE_TTL = 300; // 5 minutes
 
+// Domain configuration - allow overrides via environment variables
+const HITOMI_BASE_DOMAIN = process.env.HITOMI_BASE_DOMAIN || 'hitomi.la';
+const HITOMI_GG_DOMAINS = process.env.HITOMI_GG_DOMAINS ? process.env.HITOMI_GG_DOMAINS.split(',') : [
+  'ltn.gold-usergeneratedcontent.net',
+  'ltn.hitomi.la',
+  'hitomi.la',
+  'a.hitomi.la',
+  'b.hitomi.la',
+  'c.hitomi.la',
+];
+const HITOMI_IMAGE_DOMAINS = process.env.HITOMI_IMAGE_DOMAINS ? process.env.HITOMI_IMAGE_DOMAINS.split(',') : [
+  'a.hitomi.la', 'b.hitomi.la', 'c.hitomi.la', 'd.hitomi.la', 'e.hitomi.la',
+  'f.hitomi.la', 'g.hitomi.la', 'h.hitomi.la', 'i.hitomi.la', 'j.hitomi.la',
+  'k.hitomi.la', 'l.hitomi.la', 'm.hitomi.la', 'n.hitomi.la', 'o.hitomi.la',
+  'p.hitomi.la', 'q.hitomi.la', 'r.hitomi.la', 's.hitomi.la', 't.hitomi.la',
+  'u.hitomi.la', 'v.hitomi.la', 'w.hitomi.la', 'x.hitomi.la', 'y.hitomi.la',
+  'z.hitomi.la', 'ltn.hitomi.la'
+];
+
+// Proxy support - if set, all requests will go through this proxy
+const HTTP_PROXY = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null;
+
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -125,7 +147,7 @@ class AntiBlockingManager {
   }
 
   createSession() {
-    return axios.create({
+    const config = {
       timeout: 30000,
       maxRedirects: 5,
       headers: {
@@ -137,7 +159,18 @@ class AntiBlockingManager {
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
       },
-    });
+    };
+    
+    // Add proxy if configured
+    if (HTTP_PROXY) {
+      config.proxy = {
+        host: HTTP_PROXY.replace(/^https?:\/\//, '').split(':')[0],
+        port: parseInt(HTTP_PROXY.replace(/^https?:\/\//, '').split(':')[1] || '8080', 10),
+      };
+      log('info', `Using proxy: ${HTTP_PROXY}`);
+    }
+    
+    return axios.create(config);
   }
 }
 
@@ -153,6 +186,10 @@ class HitomiGallery {
   extractId(url) {
     const match = url.match(/(\d+)\.html$/);
     return match ? match[1] : null;
+  }
+
+  getBaseUrl() {
+    return `https://${HITOMI_BASE_DOMAIN}`;
   }
 
   // Extract the files array from the JS content using bracket counting
@@ -223,14 +260,8 @@ class HitomiGallery {
 
   // --- 核心修复: 重写的 gg.js 解析逻辑 ---
   async fetchAndParseGg(session) {
-    const domains = [
-      'ltn.gold-usergeneratedcontent.net',
-      'ltn.hitomi.la',
-      'hitomi.la',
-      'a.hitomi.la',
-      'b.hitomi.la',
-      'c.hitomi.la',
-    ];
+    // Use configurable domains or defaults
+    const domains = HITOMI_GG_DOMAINS;
     let ggContent = null;
     for (const domain of domains) {
       const url = `https://${domain}/gg.js`;
@@ -467,16 +498,16 @@ class HitomiGallery {
     let domain;
     if (defaultDomain) {
       if (defaultDomain.length <= 3 && /^[a-z]+$/.test(defaultDomain)) {
-        domain = `${defaultDomain}.hitomi.la`;
+        domain = `${defaultDomain}.${HITOMI_BASE_DOMAIN}`;
       } else if (defaultDomain.includes('.')) {
         domain = defaultDomain;
       } else {
-        domain = `${defaultDomain}.hitomi.la`;
+        domain = `${defaultDomain}.${HITOMI_BASE_DOMAIN}`;
       }
     } else {
       const subdomains = 'abcdefghijklmnopqrstuvwxyz';
       const sub = subdomains[subdomainIndex % subdomains.length];
-      domain = `${sub}.hitomi.la`;
+      domain = `${sub}.${HITOMI_BASE_DOMAIN}`;
     }
     
     const url = `https://${domain}/galleries/${galleryId}/${name}`;
@@ -488,15 +519,8 @@ class HitomiGallery {
   generateImageUrls(galleryId, image, ggData) {
     const primaryUrl = this.generateImageUrl(galleryId, image, ggData);
     
-    // List of fallback domains to try if primary fails
-    const fallbackDomains = [
-      'a.hitomi.la', 'b.hitomi.la', 'c.hitomi.la', 'd.hitomi.la', 'e.hitomi.la',
-      'f.hitomi.la', 'g.hitomi.la', 'h.hitomi.la', 'i.hitomi.la', 'j.hitomi.la',
-      'k.hitomi.la', 'l.hitomi.la', 'm.hitomi.la', 'n.hitomi.la', 'o.hitomi.la',
-      'p.hitomi.la', 'q.hitomi.la', 'r.hitomi.la', 's.hitomi.la', 't.hitomi.la',
-      'u.hitomi.la', 'v.hitomi.la', 'w.hitomi.la', 'x.hitomi.la', 'y.hitomi.la',
-      'z.hitomi.la', 'ltn.hitomi.la'
-    ];
+    // Use configurable image domains or defaults
+    const fallbackDomains = HITOMI_IMAGE_DOMAINS;
     
     // Generate fallback URLs by replacing the domain in the primary URL
     const urls = [primaryUrl];
@@ -513,14 +537,8 @@ class HitomiGallery {
   }
 
   async fetchGalleryJS(galleryId, session) {
-    const domains = [
-      'ltn.gold-usergeneratedcontent.net',
-      'ltn.hitomi.la',
-      'hitomi.la',
-      'a.hitomi.la',
-      'b.hitomi.la',
-      'c.hitomi.la',
-    ];
+    // Use configurable domains or defaults
+    const domains = HITOMI_GG_DOMAINS;
     for (const domain of domains) {
       const url = `https://${domain}/galleries/${galleryId}.js`;
       try {
@@ -547,11 +565,13 @@ class HitomiGallery {
       return cached;
     }
 
-    log('info', `Fetching gallery page: ${this.url}`);
+    // Use configurable base domain for gallery page fetch
+    const galleryPageUrl = this.url.replace(/^https?:\/\/[^\/]+/, `https://${HITOMI_BASE_DOMAIN}`);
+    log('info', `Fetching gallery page: ${galleryPageUrl}`);
     const session = antiBlock.createSession();
     let html;
     await antiBlock.executeWithRetry(async () => {
-      const res = await session.get(this.url);
+      const res = await session.get(galleryPageUrl);
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
@@ -660,13 +680,13 @@ class HitomiGallery {
 
 // Helper: construct image URL using the gg.js data
 function constructImageUrl(galleryId, image, ggData) {
-  const gallery = new HitomiGallery(`https://hitomi.la/galleries/${galleryId}.html`);
+  const gallery = new HitomiGallery(`https://${HITOMI_BASE_DOMAIN}/galleries/${galleryId}.html`);
   return gallery.generateImageUrl(galleryId, image, ggData);
 }
 
 // Helper: construct all possible image URLs (primary + fallbacks)
 function constructImageUrls(galleryId, image, ggData) {
-  const gallery = new HitomiGallery(`https://hitomi.la/galleries/${galleryId}.html`);
+  const gallery = new HitomiGallery(`https://${HITOMI_BASE_DOMAIN}/galleries/${galleryId}.html`);
   return gallery.generateImageUrls(galleryId, image, ggData);
 }
 
