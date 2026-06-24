@@ -104,18 +104,29 @@
       if (eventSource) eventSource.close();
       eventSource = new EventSource('/api/logs');
       eventSource.addEventListener('log', (e) => {
-        const data = JSON.parse(e.data);
-        appendLog(data.timestamp, data.level, data.message);
+        try {
+          const data = JSON.parse(e.data);
+          appendLog(data.timestamp, data.level, data.message);
+        } catch (err) {
+          console.error('SSE parse error:', err);
+        }
       });
       eventSource.addEventListener('progress', (e) => {
-        const { current, total, percent } = JSON.parse(e.data);
-        updateProgress(current, total, percent);
+        try {
+          const { current, total, percent } = JSON.parse(e.data);
+          updateProgress(current, total, percent);
+        } catch (err) {
+          console.error('Progress parse error:', err);
+        }
       });
       eventSource.addEventListener('complete', () => {
         resetUI();
         appendLog(null, 'info', 'Download complete!');
       });
-      eventSource.onerror = () => setTimeout(connectSSE, 3000);
+      eventSource.onerror = () => {
+        eventSource.close();
+        setTimeout(connectSSE, 3000);
+      };
     }
     connectSSE();
 
@@ -144,22 +155,47 @@
       abortController = null;
     }
 
+    // FIXED: Get Info button with proper error handling
     fetchBtn.addEventListener('click', async () => {
       const url = urlInput.value.trim();
-      if (!url) return alert('Please enter a gallery URL');
+      if (!url) {
+        alert('Please enter a gallery URL');
+        return;
+      }
+      
       fetchBtn.disabled = true;
       fetchBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Loading...';
+      
       try {
         const res = await fetch('/api/gallery/info', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url })
         });
+
+        // Check if response is OK
+        if (!res.ok) {
+          const text = await res.text();
+          console.error('Server error response:', text);
+          throw new Error(`Server error (${res.status}): ${text.substring(0, 100)}`);
+        }
+
+        // Check if response is JSON
+        const contentType = res.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          const text = await res.text();
+          console.error('Expected JSON but got:', text.substring(0, 200));
+          throw new Error('Server returned non-JSON response. Check server logs.');
+        }
+
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Failed to fetch info');
+        if (data.error) throw new Error(data.error);
+        
         currentInfo = data;
         displayInfo(data);
+        appendLog(null, 'info', `Loaded gallery: ${data.title}`);
       } catch (err) {
+        console.error('Fetch error:', err);
         appendLog(null, 'error', err.message);
         alert('Error: ' + err.message);
       } finally {
@@ -179,13 +215,19 @@
       progressSection.classList.add('hidden');
     }
 
+    // FIXED: Download button with proper error handling
     downloadBtn.addEventListener('click', async () => {
-      if (!currentInfo) return;
+      if (!currentInfo) {
+        alert('Please get gallery info first');
+        return;
+      }
+      
       const count = parseInt(imageCountInput.value, 10);
       if (isNaN(count) || count < 1 || count > currentInfo.total) {
         alert('Invalid image count');
         return;
       }
+      
       downloadBtn.disabled = true;
       cancelBtn.classList.remove('hidden');
       abortController = new AbortController();
@@ -197,10 +239,18 @@
           body: JSON.stringify({ url: urlInput.value.trim(), count }),
           signal: abortController.signal,
         });
+
+        // Check if response is OK
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || 'Download failed');
+          const text = await res.text();
+          try {
+            const err = JSON.parse(text);
+            throw new Error(err.error || 'Download failed');
+          } catch {
+            throw new Error(`Download failed (${res.status}): ${text.substring(0, 100)}`);
+          }
         }
+
         const blob = await res.blob();
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -224,7 +274,10 @@
     });
 
     cancelBtn.addEventListener('click', () => {
-      if (abortController) abortController.abort();
+      if (abortController) {
+        abortController.abort();
+        appendLog(null, 'warn', 'Cancelling download...');
+      }
       resetUI();
     });
   </script>
