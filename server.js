@@ -7,7 +7,7 @@ const archiver = require('archiver');
 const { EventEmitter } = require('events');
 const winston = require('winston');
 const NodeCache = require('node-cache');
-const puppeteer = require('puppeteer');
+const { chromium } = require('playwright');
 
 // --------------- Configuration ---------------
 const PORT = process.env.PORT || 10000;
@@ -95,15 +95,15 @@ class AntiBlockingManager {
 }
 const antiBlock = new AntiBlockingManager();
 
-// --------------- Puppeteer Parser ---------------
+// --------------- Playwright Parser ---------------
 class HitomiParser {
   constructor(galleryId) {
     this.galleryId = galleryId;
   }
 
   async fetchGalleryData() {
-    log('info', `Starting Puppeteer browser...`);
-    const browser = await puppeteer.launch({
+    log('info', 'Launching Playwright browser...');
+    const browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
@@ -115,9 +115,9 @@ class HitomiParser {
       const url = `https://hitomi.la/imageset/${this.galleryId}.html`;
       log('info', `Navigating to ${url}`);
       
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
 
-      // Wait for the gallery data to load
+      // Wait for gallery data to load
       await page.waitForFunction(
         'typeof galleryinfo !== "undefined" || typeof galleryInfo !== "undefined" || document.querySelector("img") !== null',
         { timeout: 30000 }
@@ -125,9 +125,8 @@ class HitomiParser {
 
       log('info', 'Page loaded, extracting data...');
 
-      // Extract gallery data using page.evaluate
+      // Extract data
       const data = await page.evaluate(() => {
-        // Try to find galleryinfo
         let images = null;
         let cdns = ['a', 'b', 'c', 'aa', 'ba'];
 
@@ -137,12 +136,11 @@ class HitomiParser {
           images = window.galleryInfo;
         }
 
-        // Try to find cdns
         if (typeof window.cdns !== 'undefined' && window.cdns) {
           cdns = window.cdns;
         }
 
-        // If no images found, try to extract from image elements
+        // Fallback: extract from img elements
         if (!images || !images.length) {
           const imgElements = document.querySelectorAll('img');
           const imgUrls = [];
@@ -153,13 +151,11 @@ class HitomiParser {
               imgUrls.push({ url: fileName });
             }
           });
-          if (imgUrls.length > 0) {
-            images = imgUrls;
-          }
+          if (imgUrls.length > 0) images = imgUrls;
         }
 
-        // Get title
-        const title = document.querySelector('title')?.textContent?.replace(/^Hitomi\.la\s*[-–—]\s*/, '') || `Gallery ${window.location.pathname.match(/\d+/)?.[0] || ''}`;
+        const title = document.querySelector('title')?.textContent?.replace(/^Hitomi\.la\s*[-–—]\s*/, '') || 
+                      `Gallery ${window.location.pathname.match(/\d+/)?.[0] || ''}`;
 
         return { images, cdns, title };
       });
@@ -220,8 +216,6 @@ app.post('/api/gallery/info', async (req, res) => {
     const galleryId = parseInt(match[1], 10);
 
     const info = await getGalleryInfo(galleryId);
-
-    // Estimate size (skip for speed)
     const sizeEstimate = (info.total * 0.5).toFixed(2) + ' MB';
 
     res.json({
