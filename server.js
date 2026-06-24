@@ -220,7 +220,51 @@ class HitomiGallery {
     }
   }
 
-  // --- Parse the obfuscated gg.js ---
+  // --- 使用括号计数法提取 gg 对象 ---
+  extractObject(str, startPos) {
+    let braceCount = 0;
+    let inString = false;
+    let escape = false;
+    let objStart = -1;
+    let objEnd = -1;
+
+    for (let i = startPos; i < str.length; i++) {
+      const char = str[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === '\\') {
+        escape = true;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        if (!inString) {
+          inString = char;
+        } else if (inString === char) {
+          inString = false;
+        }
+        continue;
+      }
+      if (inString) continue;
+
+      if (char === '{') {
+        if (braceCount === 0) objStart = i;
+        braceCount++;
+      } else if (char === '}') {
+        braceCount--;
+        if (braceCount === 0) {
+          objEnd = i;
+          break;
+        }
+      }
+    }
+
+    if (objStart === -1 || objEnd === -1) return null;
+    return str.substring(objStart, objEnd + 1);
+  }
+
+  // --- 解析 gg.js ---
   async fetchAndParseGg(session) {
     const domains = [
       'ltn.gold-usergeneratedcontent.net',
@@ -245,28 +289,72 @@ class HitomiGallery {
       throw new Error('Could not fetch gg.js from any domain.');
     }
 
-    // Parse the gg object
-    const ggMatch = ggContent.match(/gg\s*=\s*(\{[\s\S]*?\});/);
-    if (!ggMatch) {
-      throw new Error('Could not find gg object in gg.js');
+    // 找到 gg = 的位置
+    const ggStart = ggContent.indexOf('gg = ');
+    if (ggStart === -1) {
+      throw new Error('Could not find "gg = " in gg.js');
     }
 
-    // Parse the m function
-    const mFuncMatch = ggMatch[1].match(/m\s*:\s*function\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
-    if (!mFuncMatch) {
-      throw new Error('Could not find m function in gg object');
+    // 从 gg = 后面的位置开始提取对象
+    const objStart = ggStart + 'gg = '.length;
+    const ggObjectStr = this.extractObject(ggContent, objStart);
+    if (!ggObjectStr) {
+      throw new Error('Could not extract gg object from gg.js');
     }
 
-    const mFuncBody = mFuncMatch[1];
-    const switchMatch = mFuncBody.match(/switch\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
-    if (!switchMatch) {
+    log('info', `Extracted gg object (${ggObjectStr.length} chars)`);
+
+    // 现在从 ggObjectStr 中提取 m 函数
+    // 查找 m: function(g) 或 m:function(g)
+    const mStart = ggObjectStr.indexOf('m:');
+    if (mStart === -1) {
+      throw new Error('Could not find "m:" in gg object');
+    }
+
+    // 从 m: 后面开始提取函数体
+    const funcStart = ggObjectStr.indexOf('function', mStart);
+    if (funcStart === -1) {
+      throw new Error('Could not find "function" after m:');
+    }
+
+    // 找到函数的左括号 {
+    const braceStart = ggObjectStr.indexOf('{', funcStart);
+    if (braceStart === -1) {
+      throw new Error('Could not find function body start');
+    }
+
+    // 使用括号计数法提取函数体
+    const funcBody = this.extractObject(ggObjectStr, braceStart);
+    if (!funcBody) {
+      throw new Error('Could not extract m function body');
+    }
+
+    log('info', `Extracted m function body (${funcBody.length} chars)`);
+
+    // 从函数体中提取 switch 语句
+    const switchStart = funcBody.indexOf('switch');
+    if (switchStart === -1) {
       throw new Error('Could not find switch statement in m function');
     }
 
-    const switchBody = switchMatch[1];
-    // Split by "break;" to separate each case group
+    // 找到 switch 的左括号
+    const switchBraceStart = funcBody.indexOf('{', switchStart);
+    if (switchBraceStart === -1) {
+      throw new Error('Could not find switch body start');
+    }
+
+    // 使用括号计数法提取 switch 体
+    const switchBody = this.extractObject(funcBody, switchBraceStart);
+    if (!switchBody) {
+      throw new Error('Could not extract switch body');
+    }
+
+    log('info', `Extracted switch body (${switchBody.length} chars)`);
+
+    // 解析 case 语句
     const caseGroups = switchBody.split(/break\s*;/);
     const multiplierMap = {};
+
     for (const group of caseGroups) {
       const caseMatches = group.match(/case\s+(\d+)\s*:/g);
       if (!caseMatches) continue;
@@ -285,8 +373,8 @@ class HitomiGallery {
 
     log('info', `Parsed ${Object.keys(multiplierMap).length} gallery ID mappings from gg.js`);
 
-    // Try to extract default domain (last number)
-    const defaultMatch = ggMatch[1].match(/,\s*(\d+)\s*\]?\s*$/);
+    // 尝试提取默认域名（最后的数字）
+    const defaultMatch = ggObjectStr.match(/,\s*(\d+)\s*\]?\s*$/);
     let defaultDomain = null;
     if (defaultMatch) {
       const idx = parseInt(defaultMatch[1], 10);
@@ -298,7 +386,7 @@ class HitomiGallery {
     return { multiplierMap, defaultDomain };
   }
 
-  // --- Generate the correct image URL using the gg.js mapping ---
+  // --- 使用 gg.js 映射生成正确的图片 URL ---
   generateImageUrl(galleryId, image, ggData) {
     const { multiplierMap, defaultDomain } = ggData;
     const multiplier = multiplierMap[parseInt(galleryId, 10)];
@@ -369,7 +457,7 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    // --- Fetch and parse gg.js ---
+    // --- 获取并解析 gg.js ---
     let ggData;
     try {
       ggData = await this.fetchAndParseGg(session);
@@ -378,7 +466,7 @@ class HitomiGallery {
       throw new Error(`Unable to load gg.js: ${err.message}`);
     }
 
-    // Fetch the gallery JS file
+    // 获取画廊 JS 文件
     let jsContent;
     try {
       jsContent = await this.fetchGalleryJS(this.galleryId, session);
@@ -387,10 +475,10 @@ class HitomiGallery {
       throw new Error(`Unable to load gallery data: ${err.message}`);
     }
 
-    // Extract files array
+    // 提取 files 数组
     let files = this.extractFilesArray(jsContent);
     if (!files) {
-      // Fallback: try parsing the whole galleryinfo object
+      // 备用方案：尝试解析整个 galleryinfo 对象
       try {
         const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
         if (match) {
@@ -411,7 +499,7 @@ class HitomiGallery {
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
-    // Store images with their hashes for URL generation
+    // 存储图片及其 hash 用于 URL 生成
     const images = files.map(file => ({
       name: file.name,
       hash: file.hash,
@@ -420,7 +508,7 @@ class HitomiGallery {
       hasavif: file.hasavif || 0,
     }));
 
-    // Title from HTML
+    // 从 HTML 中提取标题
     const $ = cheerio.load(html);
     const titleTag = $('title').text().trim();
     let title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '');
@@ -429,7 +517,7 @@ class HitomiGallery {
     }
     title = title.replace(/\s*[|]\s*Hitomi\.la\s*$/i, '').trim();
 
-    // Available formats
+    // 可用格式
     const formats = [...new Set(images.map(img => img.name.split('.').pop().toLowerCase()))];
     const total = images.length;
 
@@ -448,7 +536,7 @@ class HitomiGallery {
   }
 }
 
-// Helper: construct image URL using the gg.js data
+// Helper: 使用 gg.js 数据构造图片 URL
 function constructImageUrl(galleryId, image, ggData) {
   const gallery = new HitomiGallery(`https://hitomi.la/galleries/${galleryId}.html`);
   return gallery.generateImageUrl(galleryId, image, ggData);
@@ -463,7 +551,7 @@ app.post('/api/gallery/info', async (req, res) => {
     const gallery = new HitomiGallery(url);
     const info = await gallery.getGalleryInfo();
 
-    // Estimate total size
+    // 估算总大小
     const { images, galleryId, ggData } = info;
     let totalSize = 0;
     const concurrency = 5;
@@ -601,5 +689,5 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => {
   log('info', 'SIGTERM received, shutting down');
-  server.close(() => process.exit(0));  // ✅ fixed missing parenthesis
+  server.close(() => process.exit(0));
 });
