@@ -221,7 +221,7 @@ class HitomiGallery {
     }
   }
 
-  // --- NEW: Use VM to execute gg.js and extract the objects ---
+  // --- 核心修复: 重写的 gg.js 解析逻辑 ---
   async fetchAndParseGg(session) {
     const domains = [
       'ltn.gold-usergeneratedcontent.net',
@@ -257,98 +257,90 @@ class HitomiGallery {
     const context = vm.createContext(sandbox);
     
     try {
-      // Execute the JavaScript in the sandbox
       const script = new vm.Script(ggContent);
       script.runInContext(context);
       
-      // Extract gg and GG objects
       const gg = context.gg;
       const GG = context.GG;
       
-      if (!gg && !GG) {
-        throw new Error('gg.js executed but neither gg nor GG were defined');
-      }
-      
       log('info', `Successfully executed gg.js. GG: ${GG ? 'found' : 'not found'}, gg: ${gg ? 'found' : 'not found'}`);
       
-      // If GG is found, use it directly (it's the simpler format)
+      // --- 1. 尝试解析简单的 GG 数组 ---
       if (GG && Array.isArray(GG) && GG.length >= 2) {
-        // GG = [multiplier, index, default_domain]
         const multiplier = GG[0];
         const index = GG[1];
         const defaultDomain = GG.length > 2 ? GG[2] : null;
-        
         log('info', `Found GG array: multiplier=${multiplier}, index=${index}, defaultDomain=${defaultDomain}`);
-        
-        // Build multiplier map: we'll use the same multiplier for all galleries
-        // In newer hitomi, the multiplier is the same for all galleries
         return {
-          multiplierMap: {}, // We'll handle this differently
+          multiplierMap: {},
           defaultDomain: defaultDomain || null,
           globalMultiplier: multiplier,
           globalIndex: index,
         };
       }
       
-      // If gg is found, try to extract the m function
-      if (gg && typeof gg.m === 'function') {
-        // The m function is obfuscated. We can't call it directly because it uses a switch statement
-        // But we can try to extract the multiplier map from the function source
-        const funcStr = gg.m.toString();
-        log('info', `gg.m function extracted (${funcStr.length} chars)`);
-        
-        // Extract the switch body using bracket counting
-        const switchStart = funcStr.indexOf('switch');
-        if (switchStart !== -1) {
-          const braceStart = funcStr.indexOf('{', switchStart);
-          if (braceStart !== -1) {
-            const switchBody = this.extractObject(funcStr, braceStart);
-            if (switchBody) {
-              log('info', `Extracted switch body (${switchBody.length} chars)`);
-              
-              // Parse case statements
-              const caseGroups = switchBody.split(/break\s*;/);
-              const multiplierMap = {};
-              for (const group of caseGroups) {
-                const caseMatches = group.match(/case\s+(\d+)\s*:/g);
-                if (!caseMatches) continue;
-                const oMatch = group.match(/o\s*=\s*(\d+)\s*;/);
-                if (!oMatch) continue;
-                const multiplier = parseInt(oMatch[1], 10);
-                for (const caseMatch of caseMatches) {
-                  const caseValue = parseInt(caseMatch.match(/\d+/)[0], 10);
-                  multiplierMap[caseValue] = multiplier;
+      // --- 2. 尝试解析复杂的 gg 对象 ---
+      if (gg) {
+        // 2.1 首先尝试从 gg.m 函数中提取映射
+        if (typeof gg.m === 'function') {
+          const funcStr = gg.m.toString();
+          log('info', `gg.m function extracted (${funcStr.length} chars)`);
+          
+          // 提取 switch 语句体
+          const switchStart = funcStr.indexOf('switch');
+          if (switchStart !== -1) {
+            const braceStart = funcStr.indexOf('{', switchStart);
+            if (braceStart !== -1) {
+              const switchBody = this.extractObject(funcStr, braceStart);
+              if (switchBody) {
+                log('info', `Extracted switch body (${switchBody.length} chars)`);
+                const caseGroups = switchBody.split(/break\s*;/);
+                const multiplierMap = {};
+                for (const group of caseGroups) {
+                  const caseMatches = group.match(/case\s+(\d+)\s*:/g);
+                  if (!caseMatches) continue;
+                  const oMatch = group.match(/o\s*=\s*(\d+)\s*;/);
+                  if (!oMatch) continue;
+                  const multiplier = parseInt(oMatch[1], 10);
+                  for (const caseMatch of caseMatches) {
+                    const caseValue = parseInt(caseMatch.match(/\d+/)[0], 10);
+                    multiplierMap[caseValue] = multiplier;
+                  }
                 }
-              }
-              
-              if (Object.keys(multiplierMap).length > 0) {
-                log('info', `Parsed ${Object.keys(multiplierMap).length} gallery ID mappings from gg.m`);
-                return {
-                  multiplierMap,
-                  defaultDomain: null,
-                  globalMultiplier: null,
-                  globalIndex: null,
-                };
+                if (Object.keys(multiplierMap).length > 0) {
+                  log('info', `Parsed ${Object.keys(multiplierMap).length} gallery ID mappings from gg.m`);
+                  return {
+                    multiplierMap,
+                    defaultDomain: null,
+                    globalMultiplier: null,
+                    globalIndex: null,
+                  };
+                }
               }
             }
           }
         }
-        
-        // If we couldn't parse the switch, the gg object might have a different structure
-        // Try to get the default domain from gg.d or gg.s
-        let defaultDomain = null;
-        if (gg.d) defaultDomain = gg.d;
-        else if (gg.s) defaultDomain = gg.s;
-        
-        // For newer hitomi, the gg object might have a different structure
-        // Try to find the multiplier and index from other properties
+
+        // 2.2 如果 gg.m 没有提供映射，尝试从 gg 对象的其他属性获取
+        //    常见属性: gg.o (multiplier), gg.i (index), gg.d (default domain)
         let globalMultiplier = null;
         let globalIndex = null;
-        if (gg.o) globalMultiplier = gg.o;
-        if (gg.i) globalIndex = gg.i;
-        
-        if (globalMultiplier) {
-          log('info', `Using gg.o as global multiplier: ${globalMultiplier}`);
+        let defaultDomain = null;
+
+        if (gg.o !== undefined) {
+          globalMultiplier = parseInt(gg.o, 10);
+          log('info', `Found gg.o as global multiplier: ${globalMultiplier}`);
+        }
+        if (gg.i !== undefined) {
+          globalIndex = parseInt(gg.i, 10);
+          log('info', `Found gg.i as global index: ${globalIndex}`);
+        }
+        if (gg.d !== undefined) {
+          defaultDomain = gg.d;
+          log('info', `Found gg.d as default domain: ${defaultDomain}`);
+        }
+
+        if (globalMultiplier !== null) {
           return {
             multiplierMap: {},
             defaultDomain: defaultDomain || null,
@@ -358,10 +350,8 @@ class HitomiGallery {
         }
       }
       
-      // If we couldn't extract anything useful, fall back to the old method
-      log('warn', 'Could not extract multiplier from gg.js, using fallback');
-      
-      // Try to find a GG array in the source using regex as a last resort
+      // --- 3. 最后的备用方案: 使用正则表达式在源代码中查找 GG 数组 ---
+      log('warn', 'Could not extract multiplier from gg.js, trying regex fallback');
       const ggMatch = ggContent.match(/var\s+GG\s*=\s*(\[[\s\S]*?\]);/);
       if (ggMatch) {
         try {
@@ -379,14 +369,8 @@ class HitomiGallery {
         } catch (e) { /* ignore */ }
       }
       
-      // Last resort: use multiplier 1 and hope for the best
-      log('warn', 'Using fallback multiplier 1');
-      return {
-        multiplierMap: {},
-        defaultDomain: null,
-        globalMultiplier: 1,
-        globalIndex: 26,
-      };
+      // --- 4. 如果所有方法都失败，抛出一个明确的错误 ---
+      throw new Error('Could not find any multiplier in gg.js');
       
     } catch (err) {
       log('error', `Failed to execute gg.js in VM: ${err.message}`);
@@ -442,35 +426,35 @@ class HitomiGallery {
   generateImageUrl(galleryId, image, ggData) {
     const { multiplierMap, defaultDomain, globalMultiplier, globalIndex } = ggData;
     
-    // Get the multiplier for this gallery
+    // 获取 multiplier，如果找不到则使用全局值，最后才用备用值 1
     let multiplier = null;
     if (multiplierMap && multiplierMap[parseInt(galleryId, 10)]) {
       multiplier = multiplierMap[parseInt(galleryId, 10)];
-    } else if (globalMultiplier) {
+    } else if (globalMultiplier !== null && globalMultiplier !== undefined) {
       multiplier = globalMultiplier;
     } else {
-      // Fallback: try to use any multiplier from the map
-      const keys = Object.keys(multiplierMap);
-      if (keys.length > 0) {
-        multiplier = multiplierMap[keys[0]];
-      } else {
-        multiplier = 1;
-      }
+      // 如果 multiplier 还是 null，使用备用值 1
+      multiplier = 1;
       log('warn', `No multiplier found for gallery ${galleryId}, using fallback ${multiplier}`);
+    }
+    
+    // 确保 multiplier 不为 0，防止除零错误
+    if (multiplier === 0) {
+      log('warn', `Multiplier is 0 for gallery ${galleryId}, using fallback 1`);
+      multiplier = 1;
     }
     
     const hash = image.hash;
     const name = image.name;
     const hashNum = BigInt('0x' + hash);
-    
-    // The index is the number of subdomains (usually 26 for a-z)
     const idx = globalIndex || 26;
+    
+    // 执行计算
     const subdomainIndex = Number((hashNum / BigInt(multiplier)) % BigInt(idx));
     
-    // Determine the domain
+    // 确定域名
     let domain;
     if (defaultDomain) {
-      // If defaultDomain is a string like 'a', append .hitomi.la
       if (defaultDomain.length <= 3 && /^[a-z]+$/.test(defaultDomain)) {
         domain = `${defaultDomain}.hitomi.la`;
       } else if (defaultDomain.includes('.')) {
@@ -479,7 +463,6 @@ class HitomiGallery {
         domain = `${defaultDomain}.hitomi.la`;
       }
     } else {
-      // Use subdomain based on hash
       const subdomains = 'abcdefghijklmnopqrstuvwxyz';
       const sub = subdomains[subdomainIndex % subdomains.length];
       domain = `${sub}.hitomi.la`;
@@ -530,23 +513,23 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    // --- Fetch and parse gg.js ---
+    // --- 获取并解析 gg.js ---
     let ggData;
     try {
       ggData = await this.fetchAndParseGg(session);
     } catch (err) {
       log('error', `Failed to parse gg.js: ${err.message}`);
-      // Use fallback data so we can still try to work
+      // 使用备用数据，确保 multiplier 为 1 而不是 0
       ggData = {
         multiplierMap: {},
         defaultDomain: null,
         globalMultiplier: 1,
         globalIndex: 26,
       };
-      log('warn', 'Using fallback ggData');
+      log('warn', 'Using fallback ggData with multiplier 1');
     }
 
-    // Fetch the gallery JS file
+    // 获取画廊 JS 文件
     let jsContent;
     try {
       jsContent = await this.fetchGalleryJS(this.galleryId, session);
@@ -555,10 +538,10 @@ class HitomiGallery {
       throw new Error(`Unable to load gallery data: ${err.message}`);
     }
 
-    // Extract files array
+    // 提取 files 数组
     let files = this.extractFilesArray(jsContent);
     if (!files) {
-      // Fallback: try parsing the whole galleryinfo object
+      // 备用方案：尝试解析整个 galleryinfo 对象
       try {
         const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
         if (match) {
@@ -579,7 +562,7 @@ class HitomiGallery {
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
-    // Store images with their hashes for URL generation
+    // 存储图片及其 hash 用于 URL 生成
     const images = files.map(file => ({
       name: file.name,
       hash: file.hash,
@@ -588,7 +571,7 @@ class HitomiGallery {
       hasavif: file.hasavif || 0,
     }));
 
-    // Title from HTML
+    // 从 HTML 中提取标题
     const $ = cheerio.load(html);
     const titleTag = $('title').text().trim();
     let title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '');
@@ -597,7 +580,7 @@ class HitomiGallery {
     }
     title = title.replace(/\s*[|]\s*Hitomi\.la\s*$/i, '').trim();
 
-    // Available formats
+    // 可用格式
     const formats = [...new Set(images.map(img => img.name.split('.').pop().toLowerCase()))];
     const total = images.length;
 
