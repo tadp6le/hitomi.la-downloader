@@ -220,7 +220,7 @@ class HitomiGallery {
     }
   }
 
-  // --- NEW: Parse the obfuscated gg.js ---
+  // --- Parse the obfuscated gg.js ---
   async fetchAndParseGg(session) {
     const domains = [
       'ltn.gold-usergeneratedcontent.net',
@@ -245,54 +245,34 @@ class HitomiGallery {
       throw new Error('Could not fetch gg.js from any domain.');
     }
 
-    // Parse the gg object from the script
-    // The script contains: 'use strict'; gg = { m: function(g) { ... } };
-    // We need to extract the mapping of gallery IDs to multipliers
-    
-    // First, find the gg object declaration
+    // Parse the gg object
     const ggMatch = ggContent.match(/gg\s*=\s*(\{[\s\S]*?\});/);
     if (!ggMatch) {
       throw new Error('Could not find gg object in gg.js');
     }
 
-    // Now parse the m function to extract the case statements
-    // The function looks like: m: function(g) { var o = 1; switch (g) { case 4069: case 2119: ... case 123: o = X; break; ... } return o; }
+    // Parse the m function
     const mFuncMatch = ggMatch[1].match(/m\s*:\s*function\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
     if (!mFuncMatch) {
       throw new Error('Could not find m function in gg object');
     }
 
     const mFuncBody = mFuncMatch[1];
-    
-    // Extract the switch statement
     const switchMatch = mFuncBody.match(/switch\s*\(\s*g\s*\)\s*\{([\s\S]*?)\}/);
     if (!switchMatch) {
       throw new Error('Could not find switch statement in m function');
     }
 
     const switchBody = switchMatch[1];
-    
-    // Parse case statements to build a mapping
-    // Format: case 4069: case 2119: ... case 123: o = X; break;
-    // We need to find all case groups and their corresponding o = X assignments
-    
     // Split by "break;" to separate each case group
     const caseGroups = switchBody.split(/break\s*;/);
-    
     const multiplierMap = {};
-    
     for (const group of caseGroups) {
-      // Find all case values in this group
       const caseMatches = group.match(/case\s+(\d+)\s*:/g);
       if (!caseMatches) continue;
-      
-      // Extract the o = X assignment
       const oMatch = group.match(/o\s*=\s*(\d+)\s*;/);
       if (!oMatch) continue;
-      
       const multiplier = parseInt(oMatch[1], 10);
-      
-      // For each case value, map it to the multiplier
       for (const caseMatch of caseMatches) {
         const caseValue = parseInt(caseMatch.match(/\d+/)[0], 10);
         multiplierMap[caseValue] = multiplier;
@@ -304,13 +284,11 @@ class HitomiGallery {
     }
 
     log('info', `Parsed ${Object.keys(multiplierMap).length} gallery ID mappings from gg.js`);
-    
-    // Also extract the default domain if present (the 'a' value at the end)
-    // The gg object may have additional properties
+
+    // Try to extract default domain (last number)
     const defaultMatch = ggMatch[1].match(/,\s*(\d+)\s*\]?\s*$/);
     let defaultDomain = null;
     if (defaultMatch) {
-      // The last number might be the default subdomain index
       const idx = parseInt(defaultMatch[1], 10);
       const subdomains = 'abcdefghijklmnopqrstuvwxyz';
       defaultDomain = subdomains[idx % subdomains.length] + '.hitomi.la';
@@ -323,45 +301,29 @@ class HitomiGallery {
   // --- Generate the correct image URL using the gg.js mapping ---
   generateImageUrl(galleryId, image, ggData) {
     const { multiplierMap, defaultDomain } = ggData;
-    
-    // Get the multiplier for this gallery ID
     const multiplier = multiplierMap[parseInt(galleryId, 10)];
     if (!multiplier) {
       log('warn', `No multiplier found for gallery ${galleryId}, using fallback`);
-      // Fallback: try to use the first available multiplier
       const firstKey = Object.keys(multiplierMap)[0];
-      // Use the multiplier from the first mapping as a fallback
       const fallbackMultiplier = multiplierMap[firstKey] || 1;
-      // Generate URL using the fallback
       return this.generateUrlWithMultiplier(galleryId, image, fallbackMultiplier, defaultDomain);
     }
-    
     return this.generateUrlWithMultiplier(galleryId, image, multiplier, defaultDomain);
   }
 
   generateUrlWithMultiplier(galleryId, image, multiplier, defaultDomain) {
     const hash = image.hash;
     const name = image.name;
-    
-    // Calculate subdomain index using the algorithm from gallery-dl
-    // https://github.com/mikf/gallery-dl/blob/master/gallery_dl/extractor/hitomi.py
-    // The hash is a hex string, convert to BigInt
     const hashNum = BigInt('0x' + hash);
-    // (hash / multiplier) % 26
     const subdomainIndex = Number((hashNum / BigInt(multiplier)) % BigInt(26));
-    
-    // Map to subdomain letter (a-z)
     const subdomains = 'abcdefghijklmnopqrstuvwxyz';
     const subdomain = subdomains[subdomainIndex % subdomains.length];
-    
-    // Use default domain if provided, otherwise construct with subdomain
     let domain;
     if (defaultDomain) {
       domain = defaultDomain;
     } else {
       domain = `${subdomain}.hitomi.la`;
     }
-    
     const url = `https://${domain}/galleries/${galleryId}/${name}`;
     log('info', `Generated URL: ${url} (multiplier: ${multiplier}, subdomainIndex: ${subdomainIndex})`);
     return url;
@@ -477,7 +439,7 @@ class HitomiGallery {
       formats,
       galleryId: this.galleryId,
       images,
-      ggData, // Store ggData for URL generation
+      ggData,
     };
 
     cache.set(cacheKey, info);
@@ -639,5 +601,5 @@ const server = app.listen(PORT, () => {
 
 process.on('SIGTERM', () => {
   log('info', 'SIGTERM received, shutting down');
-  server.close(() => process.exit(0);
+  server.close(() => process.exit(0));  // ✅ fixed missing parenthesis
 });
