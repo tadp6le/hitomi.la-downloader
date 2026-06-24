@@ -45,6 +45,9 @@ function log(level, message) {
 // --------------- Express App ---------------
 const app = express();
 
+// Fix for rate-limit behind proxy (Render)
+app.set('trust proxy', 1);
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
@@ -201,16 +204,13 @@ class HitomiGallery {
     }
 
     if (arrayStart === -1 || arrayEnd === -1) return null;
-    // Extract the array string and try to parse it
     const arrayStr = scriptContent.substring(arrayStart, arrayEnd + 1);
     try {
       return JSON.parse(arrayStr);
     } catch (e) {
-      // If JSON.parse fails, try to clean it up (remove comments, trailing commas, etc.)
+      // Attempt to clean up common issues (trailing commas, comments)
       try {
-        // Remove JavaScript comments
         const cleaned = arrayStr.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-        // Remove trailing commas (simple approach: replace ,] with ])
         const finalStr = cleaned.replace(/,\s*\]/g, ']');
         return JSON.parse(finalStr);
       } catch (e2) {
@@ -238,72 +238,66 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    const $ = cheerio.load(html);
+    // ---------- NEW: Fetch the external JS file that contains the image data ----------
+    // The HTML has a script like: document.write(`<script src="//${domain}/galleries/${galleryid}.js"></script>`);
+    // We'll directly fetch https://hitomi.la/galleries/${galleryId}.js
+    const jsUrl = `https://hitomi.la/galleries/${this.galleryId}.js`;
+    log('info', `Fetching external JS: ${jsUrl}`);
+    let jsContent;
+    await antiBlock.executeWithRetry(async () => {
+      const res = await session.get(jsUrl);
+      jsContent = res.data;
+    }, `fetch external JS ${this.galleryId}`);
 
-    // Extract all script contents
-    const scripts = $('script').map((i, el) => $(el).html()).get();
-
+    // Now parse jsContent for the image array
     let images = null;
     let cdns = ['a', 'b', 'c', 'aa', 'ba'];
 
-    // Try to find galleryinfo array using multiple variable names
+    // Try multiple variable names
     const varNames = ['galleryinfo', 'galleryInfo', 'galleryInfoList', 'images', 'imgData'];
     for (const name of varNames) {
-      for (const script of scripts) {
-        if (!script) continue;
-        const result = this.extractArrayFromScript(script, name);
-        if (result && Array.isArray(result) && result.length > 0) {
-          images = result;
-          log('info', `Found image data using variable "${name}"`);
-          break;
-        }
+      const result = this.extractArrayFromScript(jsContent, name);
+      if (result && Array.isArray(result) && result.length > 0) {
+        images = result;
+        log('info', `Found image data using variable "${name}" in external JS`);
+        break;
       }
-      if (images) break;
     }
 
-    // If still not found, try a generic regex search for any array of objects with "url" property
+    // If still not found, try generic regex for any array containing "url"
     if (!images) {
-      log('warn', 'No specific variable found; searching for any array containing "url" in scripts');
-      for (const script of scripts) {
-        if (!script) continue;
-        // Find any array literal that contains objects with "url"
-        const arrayMatches = script.match(/\[[\s\S]*?\{[\s\S]*?url[\s\S]*?\}[\s\S]*?\]/g);
-        if (arrayMatches) {
-          for (const arrStr of arrayMatches) {
-            try {
-              const parsed = JSON.parse(arrStr);
-              if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].url) {
-                images = parsed;
-                log('info', 'Found image data via generic array search');
-                break;
-              }
-            } catch (e) { /* ignore */ }
-          }
-          if (images) break;
+      log('warn', 'No specific variable found; searching for any array containing "url" in external JS');
+      const arrayMatches = jsContent.match(/\[[\s\S]*?\{[\s\S]*?url[\s\S]*?\}[\s\S]*?\]/g);
+      if (arrayMatches) {
+        for (const arrStr of arrayMatches) {
+          try {
+            const parsed = JSON.parse(arrStr);
+            if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].url) {
+              images = parsed;
+              log('info', 'Found image data via generic array search in external JS');
+              break;
+            }
+          } catch (e) { /* ignore */ }
         }
       }
     }
 
-    // Try to find cdns
-    for (const script of scripts) {
-      if (!script) continue;
-      const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i) || script.match(/cdns\s*=\s*(\[[^\]]*\])/i);
-      if (m) {
-        try {
-          cdns = JSON.parse(m[1]);
-          break;
-        } catch (e) {}
-      }
+    // Also try to extract cdns from the JS (might be defined there)
+    const cdnsMatch = jsContent.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i) || jsContent.match(/cdns\s*=\s*(\[[^\]]*\])/i);
+    if (cdnsMatch) {
+      try {
+        cdns = JSON.parse(cdnsMatch[1]);
+        log('info', `Found cdns from external JS: ${cdns.join(', ')}`);
+      } catch (e) {}
     }
 
     if (!images || !images.length) {
-      // Log a snippet of the first script for debugging
-      const firstScript = scripts.find(s => s && s.length > 0);
-      log('error', `No images found. First script snippet: ${firstScript ? firstScript.substring(0, 500) : 'No scripts'}`);
+      log('error', `No images found in external JS. First 500 chars of JS: ${jsContent.substring(0, 500)}`);
       throw new Error('No images found in gallery. The site might have changed its format. Please check the logs.');
     }
 
-    // Title
+    // Title from HTML
+    const $ = cheerio.load(html);
     const titleTag = $('title').text().trim();
     const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
 
