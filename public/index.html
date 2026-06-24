@@ -1,93 +1,18 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hitomi.la Downloader</title>
-    <link rel="stylesheet" href="styles.css">
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>📚 Hitomi.la Downloader</h1>
-            <p>Download galleries as ZIP files with real-time progress tracking</p>
-        </header>
-
-        <div class="input-section">
-            <input 
-                type="text" 
-                id="urlInput" 
-                placeholder="https://hitomi.la/galleries/123456.html" 
-            />
-            <button id="fetchBtn" onclick="fetchGalleryInfo()">
-                Fetch Gallery Info
-            </button>
-        </div>
-
-        <div id="errorDisplay" class="error-display" style="display: none;"></div>
-
-        <div id="galleryInfo" class="gallery-info" style="display: none;">
-            <div class="info-card">
-                <h2 id="galleryTitle">Gallery Title</h2>
-                <div class="info-grid">
-                    <div class="info-item">
-                        <span class="label">Gallery ID:</span>
-                        <span id="galleryId" class="value"></span>
-                    </div>
-                    <div class="info-item">
-                        <span class="label">Total Pages:</span>
-                        <span id="pageCount" class="value"></span>
-                    </div>
-                    <div class="info-item">
-                        <span class="label">Estimated Size:</span>
-                        <span id="estimatedSize" class="value"></span>
-                    </div>
-                </div>
-                <button id="downloadBtn" class="download-btn" onclick="startDownload()">
-                    ⬇️ Download as ZIP
-                </button>
-            </div>
-        </div>
-
-        <div id="progressSection" class="progress-section" style="display: none;">
-            <div class="progress-card">
-                <h3>Download Progress</h3>
-                
-                <div class="progress-status">
-                    <div class="status-indicator" id="statusIndicator">⏳ Preparing...</div>
-                    <div class="progress-text" id="progressText">Initializing...</div>
-                </div>
-
-                <div class="progress-bar-container">
-                    <div class="progress-bar" id="progressBar">
-                        <div class="progress-fill" id="progressFill"></div>
-                    </div>
-                    <div class="progress-percentage" id="progressPercentage">0%</div>
-                </div>
-
-                <div class="file-info">
-                    <div class="info-row">
-                        <span>Current File:</span>
-                        <span id="currentFile" class="filename">-</span>
-                    </div>
-                    <div class="info-row">
-                        <span>Downloaded:</span>
-                        <span id="downloadedSize">0 MB / 0 MB</span>
-                    </div>
-                    <div class="info-row">
-                        <span>Progress:</span>
-                        <span id="imageProgress">0 / 0 images</span>
-                    </div>
-                </div>
-
-                <div class="download-log" id="downloadLog">
-                    <div class="log-header">Download Log</div>
-                    <div class="log-content" id="logContent"></div>
-                </div>
-            </div>
-        </div>
+<div class="info-grid">
+    <div class="info-item">
+        <span class="label">Gallery ID:</span>
+        <span id="galleryId" class="value"></span>
     </div>
-
-    <script src="script.js"></script>
-</body>
-  </html>
+    <div class="info-item">
+        <span class="label">Total Pages:</span>
+        <span id="pageCount" class="value"></span>
+    </div>
+    <div class="info-item">
+        <span class="label">Images to Download:</span>
+        <input type="number" id="imageLimit" min="1" class="value-input" />
+    </div>
+    <div class="info-item">
+        <span class="label">Estimated Size:</span>
+        <span id="estimatedSize" class="value"></span>
+    </div>
+</div>
