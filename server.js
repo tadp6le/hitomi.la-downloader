@@ -47,19 +47,14 @@ app.get('/api/progress/:downloadId', (req, res) => {
 });
 
 app.post('/api/gallery-info', async (req, res) => {
-    const { url } = req.body;    console.log('\n[INFO] Received request for URL:', url);
-    
-    if (!url) return res.status(400).json({ error: 'URL is required' });
+    const { url } = req.body;    if (!url) return res.status(400).json({ error: 'URL is required' });
     
     const galleryId = extractGalleryId(url);
     if (!galleryId) return res.status(400).json({ error: 'Invalid Hitomi.la URL format.' });
     
     try {
-        console.log(`[INFO] Fetching gallery ${galleryId}...`);
         const gallery = await hitomi.galleries.retrieve(parseInt(galleryId));
         const allFiles = gallery.files || [];
-        
-        console.log(`[SUCCESS] Found ${allFiles.length} files`);
         
         res.json({
             success: true,
@@ -70,8 +65,8 @@ app.post('/api/gallery-info', async (req, res) => {
             imageCount: allFiles.length
         });
     } catch (error) {
-        console.error('[ERROR] Failed to fetch gallery:', error.message);
-        res.status(500).json({ error: error.message || 'Failed to fetch gallery', success: false });
+        console.error('[ERROR] Gallery info failed:', error.message);
+        res.status(500).json({ error: error.message, success: false });
     }
 });
 
@@ -80,11 +75,12 @@ app.get('/api/download/:galleryId', async (req, res) => {
     const downloadId = req.query.downloadId || crypto.randomUUID();
     const limit = parseInt(req.query.limit) || 0;
     
-    console.log(`\n[DOWNLOAD] Request received - Gallery: ${galleryId}, Limit: ${limit}`);
-    
     let tempDir = null;
+    let isFinished = false;
 
     const cleanup = async () => {
+        if (isFinished) return;
+        isFinished = true;
         activeDownloads.delete(downloadId);
         if (tempDir) {
             await fs.remove(tempDir).catch(err => console.error('Cleanup error:', err));
@@ -92,22 +88,20 @@ app.get('/api/download/:galleryId', async (req, res) => {
         }
     };
 
+    // Ensure cleanup happens if connection drops
+    req.on('close', cleanup);
+
     try {
         activeDownloads.set(downloadId, { 
             status: 'fetching', message: 'Fetching gallery information...', current: 0, total: 0, currentFile: '' 
         });
-        console.log(`[DOWNLOAD] Retrieving gallery ${galleryId}...`);
-        const gallery = await hitomi.galleries.retrieve(parseInt(galleryId));
-        const allFiles = gallery.files || [];
+
+        const gallery = await hitomi.galleries.retrieve(parseInt(galleryId));        const allFiles = gallery.files || [];
         
-        if (allFiles.length === 0) {
-            throw new Error('No files found in this gallery');
-        }
+        if (allFiles.length === 0) throw new Error('No files found in this gallery');
         
         const filesToDownload = limit > 0 ? allFiles.slice(0, Math.min(limit, allFiles.length)) : allFiles;
         const actualLimit = filesToDownload.length;
-        
-        console.log(`[DOWNLOAD] Will download ${actualLimit} out of ${allFiles.length} files`);
         
         const title = gallery.title.display;
         
@@ -118,7 +112,6 @@ app.get('/api/download/:galleryId', async (req, res) => {
 
         tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `hitomi-${galleryId}-`));
         const downloadedImages = [];
-        let successCount = 0;
 
         for (let i = 0; i < filesToDownload.length; i++) {
             const fileObj = filesToDownload[i];
@@ -133,23 +126,14 @@ app.get('/api/download/:galleryId', async (req, res) => {
             });
 
             try {
-                console.log(`[DOWNLOAD] ${i + 1}/${actualLimit} - Resolving URL for ${originalName}`);
                 const imageUrl = await fileObj.resolveUrl(Extension.Webp);
+                if (!imageUrl) continue;
                 
-                if (!imageUrl) {
-                    console.log(`[WARN] Could not resolve URL for ${originalName}`);
-                    continue;
-                }
-                
-                console.log(`[DOWNLOAD] ${i + 1}/${actualLimit} - Downloading from ${imageUrl.substring(0, 50)}...`);
                 const filePath = path.join(tempDir, paddedName);
-                
                 const response = await axios({
-                    url: imageUrl,                    method: 'GET',
-                    responseType: 'stream',
-                    timeout: 60000,
+                    url: imageUrl, method: 'GET', responseType: 'stream', timeout: 60000,
                     headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                         'Referer': 'https://hitomi.la/'
                     }
                 });
@@ -160,30 +144,21 @@ app.get('/api/download/:galleryId', async (req, res) => {
                 await new Promise((resolve, reject) => {
                     writer.on('finish', () => {
                         downloadedImages.push({ path: filePath, name: paddedName });
-                        successCount++;
-                        console.log(`[SUCCESS] ${i + 1}/${actualLimit} - ${originalName} downloaded`);
                         resolve();
-                    });
-                    writer.on('error', (err) => {
-                        console.error(`[ERROR] Write failed for ${originalName}:`, err.message);
-                        reject(err);
-                    });
+                    });                    writer.on('error', reject);
                 });
                 
             } catch (imgError) {
-                console.error(`[ERROR] Failed to download ${originalName}:`, imgError.message);
-                // Continue with next file
+                console.error(`Failed to download ${originalName}:`, imgError.message);
             }
         }
 
-        console.log(`[INFO] Download phase complete: ${successCount}/${actualLimit} succeeded`);
-
         if (downloadedImages.length === 0) {
-            throw new Error('No images were successfully downloaded. Check server logs for details.');
+            throw new Error('No images were successfully downloaded.');
         }
 
         activeDownloads.set(downloadId, { 
-            status: 'archiving', message: `Creating ZIP (Level 9 Max Compression)...`, 
+            status: 'archiving', message: `Creating ZIP (Level 0 - Fast)...`, 
             current: actualLimit, total: actualLimit, currentFile: 'Packaging files...', 
             downloadedMB: Math.round(actualLimit * 1.5), totalMB: Math.round(actualLimit * 1.5) 
         });
@@ -191,52 +166,35 @@ app.get('/api/download/:galleryId', async (req, res) => {
         const safeTitle = title.replace(/[^a-z0-9]/gi, '_').substring(0, 50).toLowerCase();
         const zipFileName = `${safeTitle}_(${galleryId}).zip`;
         
-        console.log(`[ARCHIVE] Creating ZIP: ${zipFileName}`);
+        // FIX: Level 0 compression prevents RAM crashes on free hosting tiers
+        const archive = archiver('zip', { zlib: { level: 0 } });
         
-        const archive = archiver('zip', { zlib: { level: 9 } });
-                res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Type', 'application/zip');
         res.setHeader('Content-Disposition', `attachment; filename="${zipFileName}"`);
         archive.pipe(res);
 
-        let archivedCount = 0;
         for (const img of downloadedImages) {
-            const exists = await fs.pathExists(img.path);
-            if (exists) {
-                archive.file(img.path, { name: img.name });
-                archivedCount++;
-            }
+            archive.file(img.path, { name: img.name });
         }
-
-        console.log(`[ARCHIVE] Added ${archivedCount} files to ZIP`);
 
         await archive.finalize();
         
-        await new Promise((resolve, reject) => {
-            res.on('finish', () => {
-                console.log('[INFO] ZIP sent successfully');
-                resolve();
-            });
-            res.on('error', reject);
-        });
-        
         activeDownloads.set(downloadId, { 
             status: 'finished', message: 'Download complete!', current: actualLimit, total: actualLimit, 
-            currentFile: `Done! ${successCount}/${actualLimit} images`, 
+            currentFile: `Done! ${downloadedImages.length} images`, 
             downloadedMB: Math.round(actualLimit * 1.5), totalMB: Math.round(actualLimit * 1.5) 
         });
 
-        await cleanup();
+        // Cleanup is handled by req.on('close')
 
     } catch (error) {
         console.error('[ERROR] Download failed:', error.message);
-        console.error('[ERROR] Stack:', error.stack);
         activeDownloads.set(downloadId, { 
             status: 'error', message: error.message, 
             current: 0, total: 0, currentFile: '' 
         });
         await cleanup();
-        if (!res.headersSent) {
-            res.status(500).json({ error: error.message });
+        if (!res.headersSent) {            res.status(500).json({ error: error.message });
         }
     }
 });
