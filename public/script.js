@@ -1,5 +1,5 @@
 let currentGalleryId = null;
-let totalPages = 0; // Track total pages to validate the limit
+let totalPages = 0;
 let eventSource = null;
 let downloadLog = [];
 
@@ -47,13 +47,12 @@ async function fetchGalleryInfo() {
         if (!response.ok || !data.success) throw new Error(data.error || 'Failed to fetch');
 
         currentGalleryId = data.galleryId;
-        totalPages = data.pageCount; // Save total pages for validation        
+        totalPages = data.pageCount;        
         document.getElementById('galleryTitle').textContent = data.title;
         document.getElementById('galleryId').textContent = data.galleryId;
         document.getElementById('pageCount').textContent = data.pageCount;
         document.getElementById('estimatedSize').textContent = `~${data.estimatedSizeMB} MB`;
         
-        // Set the default limit to the total number of pages
         const limitInput = document.getElementById('imageLimit');
         limitInput.value = totalPages;
         limitInput.max = totalPages;
@@ -69,14 +68,11 @@ async function fetchGalleryInfo() {
     }
 }
 
-// --- NEW: Dynamically update estimated size when user changes the limit ---
 document.getElementById('imageLimit').addEventListener('input', function() {
     let limit = parseInt(this.value);
     if (!limit || limit < 1) limit = totalPages;
     if (limit > totalPages) limit = totalPages;
-    
-    const estimatedMB = Math.round(limit * 1.5);
-    document.getElementById('estimatedSize').textContent = `~${estimatedMB} MB`;
+    document.getElementById('estimatedSize').textContent = `~${Math.round(limit * 1.5)} MB`;
 });
 
 function showError(message) {
@@ -88,7 +84,6 @@ function showError(message) {
 function startDownload() {
     if (!currentGalleryId) return showError('No gallery selected');
 
-    // --- NEW: Get and validate the limit ---
     let limit = parseInt(document.getElementById('imageLimit').value);
     if (!limit || limit < 1) limit = totalPages;
     if (limit > totalPages) limit = totalPages;
@@ -96,12 +91,12 @@ function startDownload() {
     const downloadBtn = document.getElementById('downloadBtn');
     const progressSection = document.getElementById('progressSection');
     const downloadId = Math.random().toString(36).substring(2, 15);
+
     downloadLog = [];
     progressSection.style.display = 'block';
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Downloading...';
-    
-    document.getElementById('progressFill').style.width = '0%';
+        document.getElementById('progressFill').style.width = '0%';
     document.getElementById('progressPercentage').textContent = '0%';
     document.getElementById('statusIndicator').textContent = '⏳ Preparing...';
     document.getElementById('progressText').textContent = 'Initializing download...';
@@ -115,10 +110,13 @@ function startDownload() {
     eventSource.onmessage = (event) => updateProgress(JSON.parse(event.data));
     eventSource.onerror = () => eventSource.close();
 
-    // --- NEW: Pass the limit to the backend ---
     fetch(`/api/download/${currentGalleryId}?downloadId=${downloadId}&limit=${limit}`)
-        .then(response => {
-            if (!response.ok) throw new Error('Download failed');
+        .then(async response => {
+            // FIX: Get the actual error message from the server if it fails
+            if (!response.ok) {
+                const errData = await response.json().catch(() => ({ error: 'Unknown server error' }));
+                throw new Error(errData.error || `Server error: ${response.status}`);
+            }
             return response.blob();
         })
         .then(blob => {
@@ -141,8 +139,9 @@ function startDownload() {
         .catch(error => {
             addLog(`Download failed: ${error.message}`, 'error');
             document.getElementById('statusIndicator').textContent = '❌ Error';
+            document.getElementById('progressText').textContent = error.message;
             downloadBtn.disabled = false;
-            downloadBtn.textContent = '⬇️ Download as ZIP';
+            downloadBtn.textContent = '️ Download as ZIP';
             eventSource.close();
         });
 }
@@ -157,7 +156,7 @@ function updateProgress(data) {
 
     switch(data.status) {
         case 'fetching':
-            statusIndicator.textContent = '⏳ Fetching...';
+            statusIndicator.textContent = ' Fetching...';
             progressText.textContent = data.message;
             addLog(data.message, 'info');
             break;
@@ -181,11 +180,11 @@ function updateProgress(data) {
             }
             break;
         case 'archiving':
-            statusIndicator.textContent = '📦 Compressing (Level 9)...';
+            statusIndicator.textContent = '📦 Compressing (Level 0)...';
             progressText.textContent = data.message;
             progressFill.style.width = '100%';
             progressPercentage.textContent = '100%';
-            addLog('Creating ZIP archive with max compression...', 'info');
+            addLog('Creating ZIP archive (Fast mode)...', 'info');
             break;
         case 'finished':
             statusIndicator.textContent = '✅ Complete!';
@@ -194,8 +193,8 @@ function updateProgress(data) {
             break;
         case 'error':
             statusIndicator.textContent = '❌ Error';
-            progressText.textContent = data.message;            addLog(`Error: ${data.message}`, 'error');
-            break;
+            progressText.textContent = data.message;
+            addLog(`Error: ${data.message}`, 'error');            break;
     }
 }
 
