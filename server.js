@@ -44,8 +44,6 @@ function log(level, message) {
 
 // --------------- Express App ---------------
 const app = express();
-
-// Fix for rate-limit behind proxy (Render)
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -157,15 +155,85 @@ class HitomiGallery {
     return match ? match[1] : null;
   }
 
-  async fetchGalleryJS(galleryId, session) {
-    // The domain changed from hitomi.la to ltn.gold-usergeneratedcontent.net[reference:1]
-    const domains = [
-      'ltn.gold-usergeneratedcontent.net',  // New domain
-      'ltn.hitomi.la',                      // Old domain (fallback)
-      'hitomi.la',                          // Another fallback
-    ];
-    const errors = [];
+  // Extract the files array from the JS content using bracket counting
+  extractFilesArray(jsContent) {
+    // Find the start of "files": [
+    const filesStart = jsContent.indexOf('"files":[');
+    if (filesStart === -1) {
+      // Try without quotes
+      const altStart = jsContent.indexOf('files:[');
+      if (altStart === -1) return null;
+      // We'll start from '[' after 'files:'
+      const bracketStart = altStart + 'files:'.length;
+      // Use bracket counting from that position
+      return this.extractArrayFromPosition(jsContent, bracketStart);
+    }
+    // Start from the '[' after '"files":'
+    const bracketStart = filesStart + '"files":'.length;
+    return this.extractArrayFromPosition(jsContent, bracketStart);
+  }
 
+  extractArrayFromPosition(str, startIdx) {
+    let bracketCount = 0;
+    let inString = false;
+    let escape = false;
+    let arrayStart = -1;
+    let arrayEnd = -1;
+
+    for (let i = startIdx; i < str.length; i++) {
+      const char = str[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === '\\') {
+        escape = true;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        if (!inString) {
+          inString = char;
+        } else if (inString === char) {
+          inString = false;
+        }
+        continue;
+      }
+      if (inString) continue;
+
+      if (char === '[') {
+        if (bracketCount === 0) arrayStart = i;
+        bracketCount++;
+      } else if (char === ']') {
+        bracketCount--;
+        if (bracketCount === 0) {
+          arrayEnd = i;
+          break;
+        }
+      }
+    }
+
+    if (arrayStart === -1 || arrayEnd === -1) return null;
+    const arrayStr = str.substring(arrayStart, arrayEnd + 1);
+    try {
+      // Try to clean trailing commas and comments
+      const cleaned = arrayStr
+        .replace(/\/\/.*$/gm, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/,\s*\]/g, ']');
+      return JSON.parse(cleaned);
+    } catch (e) {
+      log('error', `Failed to parse extracted files array: ${e.message}`);
+      return null;
+    }
+  }
+
+  async fetchGalleryJS(galleryId, session) {
+    // Domains known to host the metadata
+    const domains = [
+      'ltn.gold-usergeneratedcontent.net',
+      'ltn.hitomi.la',
+      'hitomi.la',
+    ];
     for (const domain of domains) {
       const url = `https://${domain}/galleries/${galleryId}.js`;
       try {
@@ -176,12 +244,10 @@ class HitomiGallery {
           return response.data;
         }
       } catch (err) {
-        errors.push(`${url}: ${err.message}`);
+        // ignore and try next
       }
     }
-
-    log('error', `All JS fetch attempts failed: ${errors.join('; ')}`);
-    throw new Error(`Could not fetch gallery metadata JS. Tried: ${errors.length} URLs.`);
+    throw new Error('Could not fetch gallery metadata JS from any domain.');
   }
 
   async getGalleryInfo() {
@@ -202,7 +268,7 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    // Fetch the JS file containing gallery data
+    // Fetch the JS file
     let jsContent;
     try {
       jsContent = await this.fetchGalleryJS(this.galleryId, session);
@@ -211,43 +277,40 @@ class HitomiGallery {
       throw new Error(`Unable to load gallery data: ${err.message}`);
     }
 
-    // Parse the JS to extract galleryinfo object
-    // The JS file contains: var galleryinfo = { ... };
-    let galleryInfo = null;
-    
-    // Try to find galleryinfo object
-    const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
-    if (match) {
+    // Extract the files array using our robust method
+    let files = this.extractFilesArray(jsContent);
+    if (!files) {
+      // Fallback: try parsing the whole galleryinfo object
       try {
-        galleryInfo = JSON.parse(match[1]);
-        log('info', 'Successfully parsed galleryinfo from JS');
-      } catch (e) {
-        log('error', `Failed to parse galleryinfo JSON: ${e.message}`);
-        // Try to clean up and parse again
-        try {
+        const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
+        if (match) {
+          // Clean and parse
           const cleaned = match[1].replace(/\/\/.*$/gm, '').replace(/,\s*}/g, '}');
-          galleryInfo = JSON.parse(cleaned);
-          log('info', 'Successfully parsed galleryinfo after cleaning');
-        } catch (e2) {
-          log('error', `Failed to parse even after cleaning: ${e2.message}`);
+          const obj = JSON.parse(cleaned);
+          if (obj && obj.files && Array.isArray(obj.files)) {
+            files = obj.files;
+            log('info', 'Parsed files from full galleryinfo object');
+          }
         }
+      } catch (e) {
+        log('error', `Fallback parsing failed: ${e.message}`);
       }
     }
 
-    if (!galleryInfo || !galleryInfo.files || !galleryInfo.files.length) {
-      log('error', `No files found in galleryinfo. First 500 chars of JS: ${jsContent.substring(0, 500)}`);
+    if (!files || !files.length) {
+      log('error', `No files found. First 500 chars of JS: ${jsContent.substring(0, 500)}`);
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
-    // Extract images from files array
-    const images = galleryInfo.files.map(file => ({
+    // Map files to our image format
+    const images = files.map(file => ({
       url: file.name,
-      width: file.width,
-      height: file.height,
+      width: file.width || 0,
+      height: file.height || 0,
       hasavif: file.hasavif || 0,
     }));
 
-    // CDN subdomains for images
+    // CDN list for image URLs
     const cdns = ['a', 'b', 'c', 'aa', 'ba'];
 
     // Title from HTML
@@ -255,7 +318,7 @@ class HitomiGallery {
     const titleTag = $('title').text().trim();
     const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
 
-    // Formats
+    // Available formats
     const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
     const total = images.length;
 
@@ -284,9 +347,7 @@ function constructImageUrl(galleryId, imageFile, cdns) {
 app.post('/api/gallery/info', async (req, res) => {
   try {
     const { url } = req.body;
-    if (!url) {
-      return res.status(400).json({ error: 'URL required' });
-    }
+    if (!url) return res.status(400).json({ error: 'URL required' });
 
     const gallery = new HitomiGallery(url);
     const info = await gallery.getGalleryInfo();
@@ -341,9 +402,7 @@ app.post('/api/gallery/info', async (req, res) => {
 
 app.post('/api/gallery/download', async (req, res) => {
   const { url, count } = req.body;
-  if (!url || !count) {
-    return res.status(400).json({ error: 'URL and count required' });
-  }
+  if (!url || !count) return res.status(400).json({ error: 'URL and count required' });
 
   try {
     const gallery = new HitomiGallery(url);
@@ -421,7 +480,6 @@ app.get('/api/health', (req, res) => res.status(200).send('OK'));
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
-
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
