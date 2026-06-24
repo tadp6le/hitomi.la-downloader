@@ -8,11 +8,11 @@ const archiver = require('archiver');
 const { EventEmitter } = require('events');
 const winston = require('winston');
 const NodeCache = require('node-cache');
-const hitomi = require('hitomi.la');   // <-- NEW PACKAGE
+const hitomi = require('hitomi.la');
 
 // --------------- Configuration ---------------
 const PORT = process.env.PORT || 10000;
-const CACHE_TTL = 300; // 5 minutes
+const CACHE_TTL = 300;
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -22,7 +22,7 @@ const USER_AGENTS = [
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0',
 ];
 
-// --------------- Logger with SSE broadcast ---------------
+// --------------- Logger ---------------
 const logEmitter = new EventEmitter();
 const sseClients = new Set();
 
@@ -41,21 +41,15 @@ function log(level, message) {
   logEmitter.emit('log', entry);
 }
 
-// --------------- Express App ---------------
+// --------------- Express ---------------
 const app = express();
 app.set('trust proxy', 1);
-
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api/', limiter);
 
 // SSE endpoint
@@ -66,7 +60,6 @@ app.get('/api/logs', (req, res) => {
     Connection: 'keep-alive',
   });
   res.write('data: {"connected":true}\n\n');
-
   const client = { res };
   sseClients.add(client);
   req.on('close', () => sseClients.delete(client));
@@ -77,7 +70,6 @@ function broadcastSSE(event, data) {
   sseClients.forEach(client => client.res.write(payload));
 }
 
-// Override log to also broadcast SSE
 const originalLog = log;
 log = (level, message) => {
   originalLog(level, message);
@@ -86,9 +78,9 @@ log = (level, message) => {
 
 // --------------- Cache ---------------
 const cache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 120 });
-const galleryCache = new Map(); // simple in-memory cache for gallery info
+const galleryCache = new Map();
 
-// --------------- Anti-Blocking Manager ---------------
+// --------------- Anti-Blocking ---------------
 class AntiBlockingManager {
   constructor() {
     this.delayMin = 200;
@@ -143,29 +135,46 @@ class AntiBlockingManager {
 
 const antiBlock = new AntiBlockingManager();
 
-// --------------- Helper: get gallery info using hitomi.la package ---------------
+// --------------- Helper: Get gallery info with timeout ---------------
+function getGalleryInfoWithTimeout(galleryId, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`Gallery info fetch timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    log('info', `Calling hitomi.imageLinks for ID ${galleryId}...`);
+    
+    hitomi.imageLinks(galleryId, (err, links) => {
+      clearTimeout(timer);
+      if (err) {
+        log('error', `hitomi.imageLinks error: ${err.message}`);
+        return reject(err);
+      }
+      if (!links || !links.length) {
+        return reject(new Error('No images found'));
+      }
+      log('info', `Received ${links.length} image links`);
+      resolve(links);
+    });
+  });
+}
+
 async function getGalleryInfo(galleryId) {
-  // Check memory cache
   if (galleryCache.has(galleryId)) {
     log('info', `Using cached info for gallery ${galleryId}`);
     return galleryCache.get(galleryId);
   }
 
-  // Get image links
-  const links = await new Promise((resolve, reject) => {
-    hitomi.imageLinks(galleryId, (err, links) => {
-      if (err) reject(err);
-      else resolve(links);
-    });
-  });
+  log('info', `Fetching gallery info for ID: ${galleryId}`);
 
-  if (!links || !links.length) {
-    throw new Error('No images found in gallery');
-  }
+  // Step 1: Get image links (with timeout)
+  const links = await getGalleryInfoWithTimeout(galleryId, 30000);
 
-  // Get list of galleries for title
+  // Step 2: Get gallery list for title
   const list = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('List fetch timed out')), 15000);
     hitomi.list((err, list) => {
+      clearTimeout(timer);
       if (err) reject(err);
       else resolve(list);
     });
@@ -174,13 +183,11 @@ async function getGalleryInfo(galleryId) {
   const galleryMeta = list.find(g => g.id === galleryId);
   const title = galleryMeta?.name || `Gallery ${galleryId}`;
 
-  // Extract formats
   const formats = [...new Set(links.map(img => {
     const parts = img.name.split('.');
     return parts.length > 1 ? parts.pop().toLowerCase() : 'jpg';
   }))];
 
-  // Rough size estimate (500KB per image)
   const totalSize = links.length * 500 * 1024;
   const sizeEstimate = (totalSize / (1024 * 1024)).toFixed(2) + ' MB';
 
@@ -201,18 +208,12 @@ async function getGalleryInfo(galleryId) {
 app.post('/api/gallery/info', async (req, res) => {
   try {
     const { url } = req.body;
-    if (!url) {
-      return res.status(400).json({ error: 'URL required' });
-    }
+    if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // Extract gallery ID
     const match = url.match(/(\d+)\.html$/);
-    if (!match) {
-      return res.status(400).json({ error: 'Invalid gallery URL' });
-    }
+    if (!match) return res.status(400).json({ error: 'Invalid gallery URL' });
     const galleryId = parseInt(match[1], 10);
 
-    log('info', `Fetching gallery info for ID: ${galleryId}`);
     const info = await getGalleryInfo(galleryId);
 
     res.json({
@@ -222,7 +223,7 @@ app.post('/api/gallery/info', async (req, res) => {
       sizeEstimate: info.sizeEstimate,
     });
   } catch (err) {
-    console.error('Info endpoint error:', err);
+    console.error('Info error:', err);
     log('error', `Info error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
@@ -230,18 +231,13 @@ app.post('/api/gallery/info', async (req, res) => {
 
 app.post('/api/gallery/download', async (req, res) => {
   const { url, count } = req.body;
-  if (!url || !count) {
-    return res.status(400).json({ error: 'URL and count required' });
-  }
+  if (!url || !count) return res.status(400).json({ error: 'URL and count required' });
 
   try {
     const match = url.match(/(\d+)\.html$/);
-    if (!match) {
-      return res.status(400).json({ error: 'Invalid gallery URL' });
-    }
+    if (!match) return res.status(400).json({ error: 'Invalid gallery URL' });
     const galleryId = parseInt(match[1], 10);
 
-    // Get gallery info (cached)
     const info = await getGalleryInfo(galleryId);
     const downloadCount = Math.min(Math.max(1, parseInt(count, 10)), info.total);
     const { images, title } = info;
@@ -271,7 +267,7 @@ app.post('/api/gallery/download', async (req, res) => {
     for (let i = 0; i < downloadCount; i++) {
       if (aborted) break;
       const img = images[i];
-      const imgUrl = img.url; // already full URL from package
+      const imgUrl = img.url;
       const ext = img.name.split('.').pop() || 'jpg';
       const filename = `${String(i+1).padStart(3, '0')}.${ext}`;
 
@@ -313,9 +309,8 @@ app.post('/api/gallery/download', async (req, res) => {
 
 app.get('/api/health', (req, res) => res.status(200).send('OK'));
 
-// Global error handlers
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', (reason, promise) => console.error('Unhandled Rejection:', reason));
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
 const server = app.listen(PORT, () => {
   log('info', `Server running on port ${PORT}`);
