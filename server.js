@@ -157,18 +157,13 @@ class HitomiGallery {
 
   // Extract the files array from the JS content using bracket counting
   extractFilesArray(jsContent) {
-    // Find the start of "files": [
     const filesStart = jsContent.indexOf('"files":[');
     if (filesStart === -1) {
-      // Try without quotes
       const altStart = jsContent.indexOf('files:[');
       if (altStart === -1) return null;
-      // We'll start from '[' after 'files:'
       const bracketStart = altStart + 'files:'.length;
-      // Use bracket counting from that position
       return this.extractArrayFromPosition(jsContent, bracketStart);
     }
-    // Start from the '[' after '"files":'
     const bracketStart = filesStart + '"files":'.length;
     return this.extractArrayFromPosition(jsContent, bracketStart);
   }
@@ -215,7 +210,6 @@ class HitomiGallery {
     if (arrayStart === -1 || arrayEnd === -1) return null;
     const arrayStr = str.substring(arrayStart, arrayEnd + 1);
     try {
-      // Try to clean trailing commas and comments
       const cleaned = arrayStr
         .replace(/\/\/.*$/gm, '')
         .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -228,7 +222,6 @@ class HitomiGallery {
   }
 
   async fetchGalleryJS(galleryId, session) {
-    // Domains known to host the metadata
     const domains = [
       'ltn.gold-usergeneratedcontent.net',
       'ltn.hitomi.la',
@@ -244,7 +237,7 @@ class HitomiGallery {
           return response.data;
         }
       } catch (err) {
-        // ignore and try next
+        // ignore
       }
     }
     throw new Error('Could not fetch gallery metadata JS from any domain.');
@@ -268,6 +261,28 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
+    // Extract cdns from HTML scripts (original method)
+    let cdns = [];
+    const $ = cheerio.load(html);
+    const scripts = $('script').map((i, el) => $(el).html()).get();
+    for (const script of scripts) {
+      if (!script) continue;
+      const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i) || script.match(/cdns\s*=\s*(\[[^\]]*\])/i);
+      if (m) {
+        try {
+          cdns = JSON.parse(m[1]);
+          log('info', `Found cdns from HTML: ${cdns.join(', ')}`);
+          break;
+        } catch (e) {}
+      }
+    }
+
+    // If no cdns found, use modern fallback
+    if (!cdns || !cdns.length) {
+      cdns = ['ltn.gold-usergeneratedcontent.net', 'ltn.hitomi.la'];
+      log('info', `Using fallback cdns: ${cdns.join(', ')}`);
+    }
+
     // Fetch the JS file
     let jsContent;
     try {
@@ -277,14 +292,13 @@ class HitomiGallery {
       throw new Error(`Unable to load gallery data: ${err.message}`);
     }
 
-    // Extract the files array using our robust method
+    // Extract files array
     let files = this.extractFilesArray(jsContent);
     if (!files) {
       // Fallback: try parsing the whole galleryinfo object
       try {
         const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
         if (match) {
-          // Clean and parse
           const cleaned = match[1].replace(/\/\/.*$/gm, '').replace(/,\s*}/g, '}');
           const obj = JSON.parse(cleaned);
           if (obj && obj.files && Array.isArray(obj.files)) {
@@ -310,13 +324,15 @@ class HitomiGallery {
       hasavif: file.hasavif || 0,
     }));
 
-    // CDN list for image URLs
-    const cdns = ['a', 'b', 'c', 'aa', 'ba'];
-
     // Title from HTML
-    const $ = cheerio.load(html);
     const titleTag = $('title').text().trim();
-    const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
+    // Clean up title
+    let title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '');
+    if (!title || title === 'Hitomi.la') {
+      title = `Gallery ${this.galleryId}`;
+    }
+    // If title still has "| Hitomi.la" at the end, remove it
+    title = title.replace(/\s*[|]\s*Hitomi\.la\s*$/i, '').trim();
 
     // Available formats
     const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
@@ -326,7 +342,7 @@ class HitomiGallery {
       total,
       title,
       formats,
-      cdns,
+      cdns,      // now using full domains
       galleryId: this.galleryId,
       images,
     };
@@ -337,10 +353,16 @@ class HitomiGallery {
   }
 }
 
-// Helper: construct image URL
+// Helper: construct image URL using full cdns (domains)
 function constructImageUrl(galleryId, imageFile, cdns) {
-  const sub = cdns[Math.floor(Math.random() * cdns.length)];
-  return `https://${sub}.hitomi.la/galleries/${galleryId}/${imageFile}`;
+  // Choose a random CDN domain
+  const cdn = cdns[Math.floor(Math.random() * cdns.length)];
+  // If cdn is just a subdomain like 'a', we need to append .hitomi.la (backward compatibility)
+  let domain = cdn;
+  if (!cdn.includes('.') && cdn.length <= 3) {
+    domain = cdn + '.hitomi.la';
+  }
+  return `https://${domain}/galleries/${galleryId}/${imageFile}`;
 }
 
 // --------------- API Routes ---------------
