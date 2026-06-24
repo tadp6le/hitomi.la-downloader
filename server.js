@@ -145,7 +145,7 @@ class AntiBlockingManager {
 
 const antiBlock = new AntiBlockingManager();
 
-// --------------- Improved Hitomi Gallery Parser ---------------
+// --------------- Hitomi Gallery Parser ---------------
 class HitomiGallery {
   constructor(url) {
     this.url = url;
@@ -157,91 +157,29 @@ class HitomiGallery {
     return match ? match[1] : null;
   }
 
-  // Helper: extract a JSON array from a script using bracket counting
-  extractArrayFromScript(scriptContent, variableName) {
-    const regex = new RegExp(`(?:var\\s+)?${variableName}\\s*=\\s*`, 'i');
-    const match = regex.exec(scriptContent);
-    if (!match) return null;
-
-    const startIdx = match.index + match[0].length;
-    let bracketCount = 0;
-    let inString = false;
-    let escape = false;
-    let arrayStart = -1;
-    let arrayEnd = -1;
-
-    for (let i = startIdx; i < scriptContent.length; i++) {
-      const char = scriptContent[i];
-      if (escape) {
-        escape = false;
-        continue;
-      }
-      if (char === '\\') {
-        escape = true;
-        continue;
-      }
-      if (char === '"' || char === "'") {
-        if (!inString) {
-          inString = char;
-        } else if (inString === char) {
-          inString = false;
-        }
-        continue;
-      }
-      if (inString) continue;
-
-      if (char === '[') {
-        if (bracketCount === 0) arrayStart = i;
-        bracketCount++;
-      } else if (char === ']') {
-        bracketCount--;
-        if (bracketCount === 0) {
-          arrayEnd = i;
-          break;
-        }
-      }
-    }
-
-    if (arrayStart === -1 || arrayEnd === -1) return null;
-    const arrayStr = scriptContent.substring(arrayStart, arrayEnd + 1);
-    try {
-      return JSON.parse(arrayStr);
-    } catch (e) {
-      try {
-        const cleaned = arrayStr.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-        const finalStr = cleaned.replace(/,\s*\]/g, ']');
-        return JSON.parse(finalStr);
-      } catch (e2) {
-        return null;
-      }
-    }
-  }
-
-  async fetchJSWithFallback(galleryId, session) {
-    // Possible domains to try
-    const domains = ['hitomi.la', 'cdn.hitomi.la', 'a.hitomi.la', 'b.hitomi.la', 'c.hitomi.la'];
-    // Possible paths
-    const paths = [`/galleries/${galleryId}.js`, `/gallery/${galleryId}.js`, `/imageset/${galleryId}.js`];
+  async fetchGalleryJS(galleryId, session) {
+    // The domain changed from hitomi.la to ltn.gold-usergeneratedcontent.net[reference:1]
+    const domains = [
+      'ltn.gold-usergeneratedcontent.net',  // New domain
+      'ltn.hitomi.la',                      // Old domain (fallback)
+      'hitomi.la',                          // Another fallback
+    ];
     const errors = [];
 
     for (const domain of domains) {
-      for (const path of paths) {
-        const url = `https://${domain}${path}`;
-        try {
-          log('info', `Trying JS URL: ${url}`);
-          const response = await session.get(url, { timeout: 10000 });
-          if (response.status === 200) {
-            log('info', `Successfully fetched JS from ${url}`);
-            return response.data;
-          }
-        } catch (err) {
-          errors.push(`${url}: ${err.message}`);
-          // continue to next
+      const url = `https://${domain}/galleries/${galleryId}.js`;
+      try {
+        log('info', `Trying JS URL: ${url}`);
+        const response = await session.get(url, { timeout: 10000 });
+        if (response.status === 200) {
+          log('info', `✅ Successfully fetched JS from ${url}`);
+          return response.data;
         }
+      } catch (err) {
+        errors.push(`${url}: ${err.message}`);
       }
     }
 
-    // If we get here, all attempts failed
     log('error', `All JS fetch attempts failed: ${errors.join('; ')}`);
     throw new Error(`Could not fetch gallery metadata JS. Tried: ${errors.length} URLs.`);
   }
@@ -264,79 +202,60 @@ class HitomiGallery {
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
-    // Try to extract domain variable from HTML scripts (maybe used in the dynamic script)
-    const $ = cheerio.load(html);
-    let domain = 'hitomi.la'; // default
-    const scripts = $('script').map((i, el) => $(el).html()).get();
-    for (const script of scripts) {
-      if (!script) continue;
-      const match = script.match(/var\s+domain\s*=\s*['"]([^'"]+)['"]/i);
-      if (match) {
-        domain = match[1];
-        log('info', `Found domain variable: ${domain}`);
-        break;
-      }
-    }
-
-    // Now fetch the JS file using fallback
+    // Fetch the JS file containing gallery data
     let jsContent;
     try {
-      jsContent = await this.fetchJSWithFallback(this.galleryId, session);
+      jsContent = await this.fetchGalleryJS(this.galleryId, session);
     } catch (err) {
       log('error', `Failed to fetch JS: ${err.message}`);
       throw new Error(`Unable to load gallery data: ${err.message}`);
     }
 
-    // Parse JS for images
-    let images = null;
-    let cdns = ['a', 'b', 'c', 'aa', 'ba'];
-
-    const varNames = ['galleryinfo', 'galleryInfo', 'galleryInfoList', 'images', 'imgData'];
-    for (const name of varNames) {
-      const result = this.extractArrayFromScript(jsContent, name);
-      if (result && Array.isArray(result) && result.length > 0) {
-        images = result;
-        log('info', `Found image data using variable "${name}"`);
-        break;
-      }
-    }
-
-    if (!images) {
-      // Try generic array search
-      log('warn', 'No specific variable found; searching for any array containing "url" in JS');
-      const arrayMatches = jsContent.match(/\[[\s\S]*?\{[\s\S]*?url[\s\S]*?\}[\s\S]*?\]/g);
-      if (arrayMatches) {
-        for (const arrStr of arrayMatches) {
-          try {
-            const parsed = JSON.parse(arrStr);
-            if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].url) {
-              images = parsed;
-              log('info', 'Found image data via generic array search');
-              break;
-            }
-          } catch (e) { /* ignore */ }
+    // Parse the JS to extract galleryinfo object
+    // The JS file contains: var galleryinfo = { ... };
+    let galleryInfo = null;
+    
+    // Try to find galleryinfo object
+    const match = jsContent.match(/var\s+galleryinfo\s*=\s*(\{[\s\S]*?\});/);
+    if (match) {
+      try {
+        galleryInfo = JSON.parse(match[1]);
+        log('info', 'Successfully parsed galleryinfo from JS');
+      } catch (e) {
+        log('error', `Failed to parse galleryinfo JSON: ${e.message}`);
+        // Try to clean up and parse again
+        try {
+          const cleaned = match[1].replace(/\/\/.*$/gm, '').replace(/,\s*}/g, '}');
+          galleryInfo = JSON.parse(cleaned);
+          log('info', 'Successfully parsed galleryinfo after cleaning');
+        } catch (e2) {
+          log('error', `Failed to parse even after cleaning: ${e2.message}`);
         }
       }
     }
 
-    // Extract cdns from JS
-    const cdnsMatch = jsContent.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i) || jsContent.match(/cdns\s*=\s*(\[[^\]]*\])/i);
-    if (cdnsMatch) {
-      try {
-        cdns = JSON.parse(cdnsMatch[1]);
-        log('info', `Found cdns from JS: ${cdns.join(', ')}`);
-      } catch (e) {}
-    }
-
-    if (!images || !images.length) {
-      log('error', `No images found in JS. First 500 chars: ${jsContent.substring(0, 500)}`);
+    if (!galleryInfo || !galleryInfo.files || !galleryInfo.files.length) {
+      log('error', `No files found in galleryinfo. First 500 chars of JS: ${jsContent.substring(0, 500)}`);
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
+    // Extract images from files array
+    const images = galleryInfo.files.map(file => ({
+      url: file.name,
+      width: file.width,
+      height: file.height,
+      hasavif: file.hasavif || 0,
+    }));
+
+    // CDN subdomains for images
+    const cdns = ['a', 'b', 'c', 'aa', 'ba'];
+
     // Title from HTML
+    const $ = cheerio.load(html);
     const titleTag = $('title').text().trim();
     const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
 
+    // Formats
     const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
     const total = images.length;
 
