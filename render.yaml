@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: hitomi-downloader
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: MAX_IMAGES
+        value: 100
+    healthCheckPath: /api/health
+    autoDeploy: true
+    plan: free
