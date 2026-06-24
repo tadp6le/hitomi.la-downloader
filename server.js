@@ -9,15 +9,12 @@ const archiver = require('archiver');
 const { EventEmitter } = require('events');
 const winston = require('winston');
 const NodeCache = require('node-cache');
-const { wrapper } = require('axios-cookiejar-support');
-const { CookieJar } = require('tough-cookie');
 
 // --------------- Configuration ---------------
 const PORT = process.env.PORT || 10000;
 const MAX_IMAGES = parseInt(process.env.MAX_IMAGES, 10) || 200;
-const CONCURRENCY = 1; // Stream sequentially to keep memory low
 const CACHE_TTL = 300; // 5 minutes
-const IMG_REQUEST_TIMEOUT = 30000;
+
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -41,13 +38,14 @@ const logger = winston.createLogger({
 
 function log(level, message) {
   logger.log(level, message);
-  logEmitter.emit('log', { timestamp: new Date().toISOString(), level, message });
+  const entry = { timestamp: new Date().toISOString(), level, message };
+  logEmitter.emit('log', entry);
 }
 
 // --------------- Express App ---------------
 const app = express();
 
-app.use(helmet({ contentSecurityPolicy: false })); // allow inline scripts/styles for demo
+app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
@@ -60,10 +58,36 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// SSE endpoint for real-time logs and progress
+app.get('/api/logs', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('data: {"connected":true}\n\n');
+
+  const client = { res };
+  sseClients.add(client);
+  req.on('close', () => sseClients.delete(client));
+});
+
+function broadcastSSE(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(client => client.res.write(payload));
+}
+
+// Override log to broadcast SSE as well
+const originalLog = log;
+log = (level, message) => {
+  originalLog(level, message);
+  broadcastSSE('log', { timestamp: new Date().toISOString(), level, message });
+};
+
 // --------------- Cache ---------------
 const cache = new NodeCache({ stdTTL: CACHE_TTL, checkperiod: 120 });
 
-// --------------- Anti-Blocking Manager ---------------
+// --------------- Anti-Blocking Manager (no cookie jar) ---------------
 class AntiBlockingManager {
   constructor() {
     this.delayMin = 200;
@@ -100,20 +124,20 @@ class AntiBlockingManager {
   }
 
   createSession() {
-    const jar = new CookieJar();
-    const client = wrapper(axios.create({ jar }));
-    client.defaults.timeout = IMG_REQUEST_TIMEOUT;
-    client.defaults.maxRedirects = 5;
-    client.defaults.headers.common = {
-      'User-Agent': this.getRandomUserAgent(),
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Connection': 'keep-alive',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
-    };
-    return client;
+    const instance = axios.create({
+      timeout: 30000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': this.getRandomUserAgent(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+    });
+    return instance;
   }
 }
 
@@ -124,7 +148,6 @@ class HitomiGallery {
   constructor(url) {
     this.url = url;
     this.galleryId = this.extractId(url);
-    this.baseUrl = 'https://hitomi.la';
   }
 
   extractId(url) {
@@ -134,8 +157,6 @@ class HitomiGallery {
 
   async getGalleryInfo() {
     if (!this.galleryId) throw new Error('Invalid gallery URL');
-
-    // Check cache first
     const cacheKey = `gallery_${this.galleryId}`;
     const cached = cache.get(cacheKey);
     if (cached) {
@@ -155,76 +176,194 @@ class HitomiGallery {
     const scripts = $('script').map((i, el) => $(el).html()).get();
 
     // Extract galleryinfo array
-    let galleryinfo = [];
+    let images = [];
     for (const script of scripts) {
       const match = script.match(/var\s+galleryinfo\s*=\s*(\[[\s\S]*?\]);/);
       if (match) {
-        try {
-          galleryinfo = JSON.parse(match[1]);
-          break;
-        } catch (e) {
-          log('error', `Failed to parse galleryinfo JSON: ${e.message}`);
-          throw new Error('Failed to parse gallery data');
-        }
+        try { images = JSON.parse(match[1]); break; }
+        catch (e) { throw new Error('Failed to parse gallery data'); }
       }
     }
-    if (!galleryinfo.length) throw new Error('No images found in gallery');
+    if (!images.length) throw new Error('No images found');
 
-    // Extract CDN list (subdomains)
-    let cdns = ['a', 'b', 'c', 'aa', 'ba']; // fallback
+    // CDN subdomains
+    let cdns = ['a', 'b', 'c', 'aa', 'ba'];
     for (const script of scripts) {
-      const match = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\]);/);
-      if (match) {
-        try {
-          cdns = JSON.parse(match[1]);
-          break;
-        } catch (e) {}
-      }
+      const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\]);/);
+      if (m) { try { cdns = JSON.parse(m[1]); break; } catch (e) {} }
     }
 
-    // Title from <title>
-    const titleTag = $('title').text().trim();
-    const title = titleTag.replace('Hitomi.la - ', '') || `Gallery ${this.galleryId}`;
+    const title = $('title').text().trim().replace('Hitomi.la - ', '') || `Gallery ${this.galleryId}`;
+    const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
+    const total = images.length;
 
-    const formats = [...new Set(galleryinfo.map(img => img.url.split('.').pop().toLowerCase()))];
-    const total = galleryinfo.length;
-
-    const info = { total, title, formats, cdns, galleryId: this.galleryId };
+    const info = { total, title, formats, cdns, galleryId: this.galleryId, images };
     cache.set(cacheKey, info);
-    log('info', `Gallery info: "${title}" (ID: ${this.galleryId}), ${total} images, formats: ${formats.join(',')}`);
+    log('info', `Gallery: "${title}" (ID: ${this.galleryId}), ${total} images, formats: ${formats.join(',')}`);
     return info;
   }
+}
 
-  async estimateSize(info, count) {
-    const { cdns, galleryId } = info;
-    const total = Math.min(count, info.total);
-    const sizes = [];
-    log('info', `Estimating size for ${total} images...`);
+// --------------- Helper: construct image URL ---------------
+function constructImageUrl(galleryId, imageFile, cdns) {
+  const sub = cdns[Math.floor(Math.random() * cdns.length)];
+  return `https://${sub}.hitomi.la/galleries/${galleryId}/${imageFile}`;
+}
 
-    const session = antiBlock.createSession();
-    let completed = 0;
+// --------------- API Routes ---------------
+app.post('/api/gallery/info', async (req, res) => {
+  try {
+    const { url } = req.body;
+    if (!url) return res.status(400).json({ error: 'URL required' });
 
-    // Use limited concurrency for HEAD requests
-    const queue = Array.from({ length: total }, (_, i) => i);
+    const gallery = new HitomiGallery(url);
+    const info = await gallery.getGalleryInfo();
+
+    // Estimate total size for all images
+    const { images, cdns, galleryId } = info;
+    let totalSize = 0;
     const concurrency = 5;
-    const promises = [];
-    const process = async () => {
+    let completed = 0;
+    const total = images.length;
+    const queue = [...Array(total).keys()];
+
+    log('info', `Estimating total size (${total} images)...`);
+    const session = antiBlock.createSession();
+    const fetchHead = async () => {
       while (queue.length) {
         const idx = queue.shift();
-        const subdomain = cdns[Math.floor(Math.random() * cdns.length)];
-        const ext = info.formats[0]; // we'll guess based on first format, but actual per image will be determined later
-        // We need actual file name from galleryinfo to get correct URL.
-        // But we don't have galleryinfo here. We'll store galleryinfo in cache as well.
-        // For size estimation we need the actual image filenames, so we'll pass galleryinfo from getGalleryInfo.
-        // I'll extend getGalleryInfo to also return the image list or we fetch it again.
-        // Let's store galleryinfo in cache along with info.
-        // Modify cache: store { info, images } where images is galleryinfo array.
+        const img = images[idx];
+        const url = constructImageUrl(galleryId, img.url, cdns);
+        try {
+          await antiBlock.executeWithRetry(async () => {
+            const headRes = await session.head(url);
+            const len = parseInt(headRes.headers['content-length'], 10);
+            if (len) totalSize += len;
+          }, `HEAD ${url}`);
+        } catch (e) {
+          log('warn', `Skipped size check for image ${idx+1}: ${e.message}`);
+        }
+        completed++;
+        if (completed % 10 === 0 || completed === total) {
+          log('info', `Size estimation: ${completed}/${total}`);
+        }
       }
     };
 
-    // Since we need galleryinfo for file names, let's fetch it again or store it. I'll store it.
-    // I'll update getGalleryInfo to also return images array.
-  }
+    const workers = Array(Math.min(concurrency, total)).fill(0).map(() => fetchHead());
+    await Promise.all(workers);
 
-  // I'll restructure: getGalleryInfo returns { ...info, images: galleryinfo }
+    const sizeEstimate = totalSize ? (totalSize / (1024*1024)).toFixed(2) + ' MB' : 'unknown';
+    log('info', `Estimated total size: ${sizeEstimate}`);
+    res.json({
+      total: info.total,
+      title: info.title,
+      formats: info.formats,
+      sizeEstimate,
+    });
+  } catch (err) {
+    log('error', `Info error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/gallery/download', async (req, res) => {
+  const { url, count } = req.body;
+  if (!url || !count) return res.status(400).json({ error: 'URL and count required' });
+
+  try {
+    const gallery = new HitomiGallery(url);
+    const info = await gallery.getGalleryInfo();
+    const downloadCount = Math.min(Math.max(1, parseInt(count, 10)), info.total);
+    const { images, cdns, galleryId, title } = info;
+
+    log('info', `Starting ZIP creation for ${downloadCount} images from "${title}"`);
+
+    // Set response headers
+    const safeFilename = title.replace(/[\\/:*?"<>|]/g, '_') + '.zip';
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    const archive = archiver('zip', { zlib: { level: 0 }, store: true });
+    archive.on('error', (err) => {
+      log('error', `Archive error: ${err.message}`);
+      if (!res.headersSent) res.status(500).end();
+    });
+    archive.pipe(res);
+
+    let aborted = false;
+    req.on('close', () => {
+      aborted = true;
+      archive.abort();
+      log('warn', 'Download aborted by client');
+    });
+
+    const session = antiBlock.createSession();
+    for (let i = 0; i < downloadCount; i++) {
+      if (aborted) break;
+      const img = images[i];
+      const url = constructImageUrl(galleryId, img.url, cdns);
+      const ext = img.url.split('.').pop();
+      const filename = `${i+1}.${ext}`;
+
+      try {
+        // Get content-length first for streaming without buffering
+        let size = 0;
+        await antiBlock.executeWithRetry(async () => {
+          const headRes = await session.head(url);
+          size = parseInt(headRes.headers['content-length'], 10) || 0;
+        }, `HEAD ${url}`);
+
+        // Now fetch the image as stream
+        const imageStream = await antiBlock.executeWithRetry(async () => {
+          const response = await session.get(url, { responseType: 'stream' });
+          return response.data;
+        }, `GET ${url}`);
+
+        archive.append(imageStream, { name: filename, store: true, size });
+        log('info', `Added ${filename} (${(size/1024).toFixed(1)} KB)`);
+
+        // Progress
+        const percent = Math.round(((i+1) / downloadCount) * 100);
+        broadcastSSE('progress', { current: i+1, total: downloadCount, percent });
+
+      } catch (err) {
+        log('error', `Failed to add image ${i+1}: ${err.message}`);
+        // Continue with next image
       }
+    }
+
+    await archive.finalize();
+    log('info', `ZIP completed: ${safeFilename}`);
+    broadcastSSE('progress', { current: downloadCount, total: downloadCount, percent: 100 });
+    broadcastSSE('complete', { filename: safeFilename });
+
+  } catch (err) {
+    log('error', `Download error: ${err.message}`);
+    if (!res.headersSent) res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/health', (req, res) => res.status(200).send('OK'));
+
+// --------------- Global error handlers ---------------
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  process.exit(1);
+});
+
+// --------------- Start server ---------------
+const server = app.listen(PORT, () => {
+  log('info', `Server running on port ${PORT}`);
+});
+
+// Graceful shutdown for Render
+process.on('SIGTERM', () => {
+  log('info', 'SIGTERM received, shutting down');
+  server.close(() => process.exit(0));
+});
