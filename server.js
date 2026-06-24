@@ -15,6 +15,28 @@ const vm = require('vm');
 const PORT = process.env.PORT || 10000;
 const CACHE_TTL = 300; // 5 minutes
 
+// Domain configuration - allow overrides via environment variables
+const HITOMI_BASE_DOMAIN = process.env.HITOMI_BASE_DOMAIN || 'hitomi.la';
+const HITOMI_GG_DOMAINS = process.env.HITOMI_GG_DOMAINS ? process.env.HITOMI_GG_DOMAINS.split(',') : [
+  'ltn.gold-usergeneratedcontent.net',
+  'ltn.hitomi.la',
+  'hitomi.la',
+  'a.hitomi.la',
+  'b.hitomi.la',
+  'c.hitomi.la',
+];
+const HITOMI_IMAGE_DOMAINS = process.env.HITOMI_IMAGE_DOMAINS ? process.env.HITOMI_IMAGE_DOMAINS.split(',') : [
+  'a.hitomi.la', 'b.hitomi.la', 'c.hitomi.la', 'd.hitomi.la', 'e.hitomi.la',
+  'f.hitomi.la', 'g.hitomi.la', 'h.hitomi.la', 'i.hitomi.la', 'j.hitomi.la',
+  'k.hitomi.la', 'l.hitomi.la', 'm.hitomi.la', 'n.hitomi.la', 'o.hitomi.la',
+  'p.hitomi.la', 'q.hitomi.la', 'r.hitomi.la', 's.hitomi.la', 't.hitomi.la',
+  'u.hitomi.la', 'v.hitomi.la', 'w.hitomi.la', 'x.hitomi.la', 'y.hitomi.la',
+  'z.hitomi.la', 'ltn.hitomi.la'
+];
+
+// Proxy support - if set, all requests will go through this proxy
+const HTTP_PROXY = process.env.HTTP_PROXY || process.env.HTTPS_PROXY || null;
+
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -125,7 +147,7 @@ class AntiBlockingManager {
   }
 
   createSession() {
-    return axios.create({
+    const config = {
       timeout: 30000,
       maxRedirects: 5,
       headers: {
@@ -137,7 +159,18 @@ class AntiBlockingManager {
         'Cache-Control': 'no-cache',
         'Pragma': 'no-cache',
       },
-    });
+    };
+    
+    // Add proxy if configured
+    if (HTTP_PROXY) {
+      config.proxy = {
+        host: HTTP_PROXY.replace(/^https?:\/\//, '').split(':')[0],
+        port: parseInt(HTTP_PROXY.replace(/^https?:\/\//, '').split(':')[1] || '8080', 10),
+      };
+      log('info', `Using proxy: ${HTTP_PROXY}`);
+    }
+    
+    return axios.create(config);
   }
 }
 
@@ -153,6 +186,10 @@ class HitomiGallery {
   extractId(url) {
     const match = url.match(/(\d+)\.html$/);
     return match ? match[1] : null;
+  }
+
+  getBaseUrl() {
+    return `https://${HITOMI_BASE_DOMAIN}`;
   }
 
   // Extract the files array from the JS content using bracket counting
@@ -223,10 +260,8 @@ class HitomiGallery {
 
   // --- 核心修复: 重写的 gg.js 解析逻辑 ---
   async fetchAndParseGg(session) {
-    const domains = [
-      'ltn.gold-usergeneratedcontent.net',
-      'ltn.hitomi.la',
-    ];
+    // Use configurable domains or defaults
+    const domains = HITOMI_GG_DOMAINS;
     let ggContent = null;
     for (const domain of domains) {
       const url = `https://${domain}/gg.js`;
@@ -239,11 +274,18 @@ class HitomiGallery {
           break;
         }
       } catch (err) {
-        // ignore
+        log('warn', `Failed to fetch gg.js from ${domain}: ${err.message}`);
       }
     }
     if (!ggContent) {
-      throw new Error('Could not fetch gg.js from any domain.');
+      log('warn', 'Could not fetch gg.js from any domain, using fallback values');
+      // Return fallback ggData instead of throwing
+      return {
+        multiplierMap: {},
+        defaultDomain: null,
+        globalMultiplier: 1,
+        globalIndex: 26,
+      };
     }
 
     // Create a sandbox context and execute gg.js
@@ -456,16 +498,16 @@ class HitomiGallery {
     let domain;
     if (defaultDomain) {
       if (defaultDomain.length <= 3 && /^[a-z]+$/.test(defaultDomain)) {
-        domain = `${defaultDomain}.hitomi.la`;
+        domain = `${defaultDomain}.${HITOMI_BASE_DOMAIN}`;
       } else if (defaultDomain.includes('.')) {
         domain = defaultDomain;
       } else {
-        domain = `${defaultDomain}.hitomi.la`;
+        domain = `${defaultDomain}.${HITOMI_BASE_DOMAIN}`;
       }
     } else {
       const subdomains = 'abcdefghijklmnopqrstuvwxyz';
       const sub = subdomains[subdomainIndex % subdomains.length];
-      domain = `${sub}.hitomi.la`;
+      domain = `${sub}.${HITOMI_BASE_DOMAIN}`;
     }
     
     const url = `https://${domain}/galleries/${galleryId}/${name}`;
@@ -473,12 +515,30 @@ class HitomiGallery {
     return url;
   }
 
+  // --- Generate alternative image URLs with fallback domains ---
+  generateImageUrls(galleryId, image, ggData) {
+    const primaryUrl = this.generateImageUrl(galleryId, image, ggData);
+    
+    // Use configurable image domains or defaults
+    const fallbackDomains = HITOMI_IMAGE_DOMAINS;
+    
+    // Generate fallback URLs by replacing the domain in the primary URL
+    const urls = [primaryUrl];
+    const primaryDomain = new URL(primaryUrl).hostname;
+    
+    for (const fallbackDomain of fallbackDomains) {
+      if (fallbackDomain !== primaryDomain) {
+        const fallbackUrl = primaryUrl.replace(primaryDomain, fallbackDomain);
+        urls.push(fallbackUrl);
+      }
+    }
+    
+    return urls;
+  }
+
   async fetchGalleryJS(galleryId, session) {
-    const domains = [
-      'ltn.gold-usergeneratedcontent.net',
-      'ltn.hitomi.la',
-      'hitomi.la',
-    ];
+    // Use configurable domains or defaults
+    const domains = HITOMI_GG_DOMAINS;
     for (const domain of domains) {
       const url = `https://${domain}/galleries/${galleryId}.js`;
       try {
@@ -489,7 +549,7 @@ class HitomiGallery {
           return response.data;
         }
       } catch (err) {
-        // ignore
+        log('warn', `Failed to fetch JS from ${domain}: ${err.message}`);
       }
     }
     throw new Error('Could not fetch gallery metadata JS from any domain.');
@@ -505,11 +565,13 @@ class HitomiGallery {
       return cached;
     }
 
-    log('info', `Fetching gallery page: ${this.url}`);
+    // Use configurable base domain for gallery page fetch
+    const galleryPageUrl = this.url.replace(/^https?:\/\/[^\/]+/, `https://${HITOMI_BASE_DOMAIN}`);
+    log('info', `Fetching gallery page: ${galleryPageUrl}`);
     const session = antiBlock.createSession();
     let html;
     await antiBlock.executeWithRetry(async () => {
-      const res = await session.get(this.url);
+      const res = await session.get(galleryPageUrl);
       html = res.data;
     }, `fetch gallery page ${this.galleryId}`);
 
@@ -535,7 +597,24 @@ class HitomiGallery {
       jsContent = await this.fetchGalleryJS(this.galleryId, session);
     } catch (err) {
       log('error', `Failed to fetch JS: ${err.message}`);
-      throw new Error(`Unable to load gallery data: ${err.message}`);
+      // Try to fetch from the gallery page HTML as a last resort
+      try {
+        const $ = cheerio.load(html);
+        const scriptTag = $('script').filter((i, el) => {
+          const content = $(el).html() || '';
+          return content.includes('galleryinfo') || content.includes('"files":');
+        }).first();
+        
+        if (scriptTag.length) {
+          const scriptContent = scriptTag.html();
+          log('info', 'Found gallery data in HTML script tag, attempting to parse');
+          jsContent = scriptContent;
+        } else {
+          throw new Error(`Unable to load gallery data: ${err.message}`);
+        }
+      } catch (fallbackErr) {
+        throw new Error(`Unable to load gallery data: ${err.message}. ${fallbackErr.message}`);
+      }
     }
 
     // 提取 files 数组
@@ -601,8 +680,14 @@ class HitomiGallery {
 
 // Helper: construct image URL using the gg.js data
 function constructImageUrl(galleryId, image, ggData) {
-  const gallery = new HitomiGallery(`https://hitomi.la/galleries/${galleryId}.html`);
+  const gallery = new HitomiGallery(`https://${HITOMI_BASE_DOMAIN}/galleries/${galleryId}.html`);
   return gallery.generateImageUrl(galleryId, image, ggData);
+}
+
+// Helper: construct all possible image URLs (primary + fallbacks)
+function constructImageUrls(galleryId, image, ggData) {
+  const gallery = new HitomiGallery(`https://${HITOMI_BASE_DOMAIN}/galleries/${galleryId}.html`);
+  return gallery.generateImageUrls(galleryId, image, ggData);
 }
 
 // --------------- API Routes ---------------
@@ -627,15 +712,27 @@ app.post('/api/gallery/info', async (req, res) => {
       while (queue.length) {
         const idx = queue.shift();
         const img = images[idx];
-        const url = constructImageUrl(galleryId, img, ggData);
-        try {
-          await antiBlock.executeWithRetry(async () => {
-            const headRes = await session.head(url);
-            const len = parseInt(headRes.headers['content-length'], 10);
-            if (len) totalSize += len;
-          }, `HEAD ${url}`);
-        } catch (e) {
-          log('warn', `Skipped size check for image ${idx+1}: ${e.message}`);
+        const urls = constructImageUrls(galleryId, img, ggData);
+        let success = false;
+        
+        for (const url of urls) {
+          try {
+            await antiBlock.executeWithRetry(async () => {
+              const headRes = await session.head(url);
+              const len = parseInt(headRes.headers['content-length'], 10);
+              if (len) {
+                totalSize += len;
+                success = true;
+              }
+            }, `HEAD ${url}`);
+            if (success) break;
+          } catch (e) {
+            log('warn', `HEAD failed for ${url}: ${e.message}`);
+          }
+        }
+        
+        if (!success) {
+          log('warn', `Skipped size check for image ${idx+1}: all URLs failed`);
         }
       }
     };
@@ -697,29 +794,46 @@ app.post('/api/gallery/download', async (req, res) => {
     for (let i = 0; i < downloadCount; i++) {
       if (aborted) break;
       const img = images[i];
-      const imgUrl = constructImageUrl(galleryId, img, ggData);
+      const imgUrls = constructImageUrls(galleryId, img, ggData);
       const ext = img.name.split('.').pop();
       const filename = `${i+1}.${ext}`;
 
-      try {
-        let size = 0;
-        await antiBlock.executeWithRetry(async () => {
-          const headRes = await session.head(imgUrl);
-          size = parseInt(headRes.headers['content-length'], 10) || 0;
-        }, `HEAD ${imgUrl}`);
+      let success = false;
+      let size = 0;
+      let imageStream = null;
+      let workingUrl = null;
 
-        const imageStream = await antiBlock.executeWithRetry(async () => {
-          const response = await session.get(imgUrl, { responseType: 'stream' });
-          return response.data;
-        }, `GET ${imgUrl}`);
+      // Try all URLs until one works
+      for (const imgUrl of imgUrls) {
+        try {
+          // Try HEAD first
+          await antiBlock.executeWithRetry(async () => {
+            const headRes = await session.head(imgUrl);
+            size = parseInt(headRes.headers['content-length'], 10) || 0;
+          }, `HEAD ${imgUrl}`);
 
+          // Try GET
+          imageStream = await antiBlock.executeWithRetry(async () => {
+            const response = await session.get(imgUrl, { responseType: 'stream' });
+            return response.data;
+          }, `GET ${imgUrl}`);
+
+          workingUrl = imgUrl;
+          success = true;
+          break;
+        } catch (err) {
+          log('warn', `Failed to fetch ${imgUrl}: ${err.message}`);
+        }
+      }
+
+      if (success && imageStream) {
         archive.append(imageStream, { name: filename, store: true, size });
-        log('info', `Added ${filename} (${(size/1024).toFixed(1)} KB)`);
+        log('info', `Added ${filename} (${(size/1024).toFixed(1)} KB) from ${workingUrl}`);
 
         const percent = Math.round(((i+1) / downloadCount) * 100);
         broadcastSSE('progress', { current: i+1, total: downloadCount, percent });
-      } catch (err) {
-        log('error', `Failed to add image ${i+1}: ${err.message}`);
+      } else {
+        log('error', `Failed to add image ${i+1}: all URLs failed`);
       }
     }
 
