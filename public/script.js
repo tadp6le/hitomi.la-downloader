@@ -1,4 +1,5 @@
 let currentGalleryId = null;
+let totalPages = 0; // Track total pages to validate the limit
 let eventSource = null;
 let downloadLog = [];
 
@@ -26,10 +27,7 @@ async function fetchGalleryInfo() {
     const galleryInfo = document.getElementById('galleryInfo');
     const url = urlInput.value.trim();
 
-    if (!url) {
-        showError('Please enter a Hitomi.la gallery URL');
-        return;
-    }
+    if (!url) return showError('Please enter a Hitomi.la gallery URL');
 
     errorDisplay.style.display = 'none';
     galleryInfo.style.display = 'none';
@@ -37,45 +35,50 @@ async function fetchGalleryInfo() {
     
     fetchBtn.disabled = true;
     fetchBtn.textContent = 'Fetching...';
-    fetchBtn.style.backgroundColor = '#666'; // Explicitly change color
 
     try {
-        console.log('Sending request to /api/gallery-info with URL:', url);
         const response = await fetch('/api/gallery-info', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ url })
         });
 
-        console.log('Response status:', response.status);        const data = await response.json();
-        console.log('Response data:', data);
-
-        if (!response.ok || !data.success) {
-            throw new Error(data.error || 'Failed to fetch gallery information');
-        }
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Failed to fetch');
 
         currentGalleryId = data.galleryId;
-        
+        totalPages = data.pageCount; // Save total pages for validation        
         document.getElementById('galleryTitle').textContent = data.title;
         document.getElementById('galleryId').textContent = data.galleryId;
         document.getElementById('pageCount').textContent = data.pageCount;
         document.getElementById('estimatedSize').textContent = `~${data.estimatedSizeMB} MB`;
         
+        // Set the default limit to the total number of pages
+        const limitInput = document.getElementById('imageLimit');
+        limitInput.value = totalPages;
+        limitInput.max = totalPages;
+        
         galleryInfo.style.display = 'block';
         addLog(`Gallery info fetched: ${data.title}`, 'success');
 
     } catch (error) {
-        console.error('Fetch error:', error);
-        // Show error and KEEP IT VISIBLE so you can read it
-        showError(error.message || 'An unknown error occurred. Check the browser console (F12) for details.');
+        showError(error.message || 'An unknown error occurred.');
     } finally {
         fetchBtn.disabled = false;
         fetchBtn.textContent = 'Fetch Gallery Info';
-        fetchBtn.style.backgroundColor = ''; // Reset color
     }
 }
 
-// --- FIX: Error message NO LONGER hides automatically ---
+// --- NEW: Dynamically update estimated size when user changes the limit ---
+document.getElementById('imageLimit').addEventListener('input', function() {
+    let limit = parseInt(this.value);
+    if (!limit || limit < 1) limit = totalPages;
+    if (limit > totalPages) limit = totalPages;
+    
+    const estimatedMB = Math.round(limit * 1.5);
+    document.getElementById('estimatedSize').textContent = `~${estimatedMB} MB`;
+});
+
 function showError(message) {
     const errorDisplay = document.getElementById('errorDisplay');
     errorDisplay.textContent = message;
@@ -83,34 +86,37 @@ function showError(message) {
 }
 
 function startDownload() {
-    if (!currentGalleryId) {
-        showError('No gallery selected');
-        return;
-    }
+    if (!currentGalleryId) return showError('No gallery selected');
+
+    // --- NEW: Get and validate the limit ---
+    let limit = parseInt(document.getElementById('imageLimit').value);
+    if (!limit || limit < 1) limit = totalPages;
+    if (limit > totalPages) limit = totalPages;
 
     const downloadBtn = document.getElementById('downloadBtn');
     const progressSection = document.getElementById('progressSection');
     const downloadId = Math.random().toString(36).substring(2, 15);
-
     downloadLog = [];
     progressSection.style.display = 'block';
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Downloading...';
-        document.getElementById('progressFill').style.width = '0%';
+    
+    document.getElementById('progressFill').style.width = '0%';
     document.getElementById('progressPercentage').textContent = '0%';
     document.getElementById('statusIndicator').textContent = '⏳ Preparing...';
     document.getElementById('progressText').textContent = 'Initializing download...';
     document.getElementById('currentFile').textContent = '-';
     document.getElementById('downloadedSize').textContent = '0 MB / 0 MB';
-    document.getElementById('imageProgress').textContent = '0 / 0 images';
+    document.getElementById('imageProgress').textContent = `0 / ${limit} images`;
 
-    addLog('Starting download...', 'info');
+    addLog(`Starting download of ${limit} images...`, 'info');
 
     eventSource = new EventSource(`/api/progress/${downloadId}`);
     eventSource.onmessage = (event) => updateProgress(JSON.parse(event.data));
     eventSource.onerror = () => eventSource.close();
 
-    fetch(`/api/download/${currentGalleryId}?downloadId=${downloadId}`)
+    // --- NEW: Pass the limit to the backend ---
+    fetch(`/api/download/${currentGalleryId}?downloadId=${downloadId}&limit=${limit}`)
         .then(response => {
             if (!response.ok) throw new Error('Download failed');
             return response.blob();
@@ -133,7 +139,6 @@ function startDownload() {
             }, 2000);
         })
         .catch(error => {
-            console.error('Download error:', error);
             addLog(`Download failed: ${error.message}`, 'error');
             document.getElementById('statusIndicator').textContent = '❌ Error';
             downloadBtn.disabled = false;
@@ -141,11 +146,11 @@ function startDownload() {
             eventSource.close();
         });
 }
-
 function updateProgress(data) {
     const statusIndicator = document.getElementById('statusIndicator');
     const progressText = document.getElementById('progressText');
-    const progressFill = document.getElementById('progressFill');    const progressPercentage = document.getElementById('progressPercentage');
+    const progressFill = document.getElementById('progressFill');
+    const progressPercentage = document.getElementById('progressPercentage');
     const currentFile = document.getElementById('currentFile');
     const downloadedSize = document.getElementById('downloadedSize');
     const imageProgress = document.getElementById('imageProgress');
@@ -176,11 +181,11 @@ function updateProgress(data) {
             }
             break;
         case 'archiving':
-            statusIndicator.textContent = '📦 Creating ZIP...';
+            statusIndicator.textContent = '📦 Compressing (Level 9)...';
             progressText.textContent = data.message;
             progressFill.style.width = '100%';
             progressPercentage.textContent = '100%';
-            addLog('Creating ZIP archive...', 'info');
+            addLog('Creating ZIP archive with max compression...', 'info');
             break;
         case 'finished':
             statusIndicator.textContent = '✅ Complete!';
@@ -189,11 +194,11 @@ function updateProgress(data) {
             break;
         case 'error':
             statusIndicator.textContent = '❌ Error';
-            progressText.textContent = data.message;
-            addLog(`Error: ${data.message}`, 'error');
+            progressText.textContent = data.message;            addLog(`Error: ${data.message}`, 'error');
             break;
     }
 }
+
 document.getElementById('urlInput').addEventListener('keypress', function(e) {
     if (e.key === 'Enter') fetchGalleryInfo();
 });
