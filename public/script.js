@@ -4,12 +4,7 @@ let downloadLog = [];
 
 function addLog(message, type = 'info') {
     const timestamp = new Date().toLocaleTimeString();
-    const logEntry = {
-        timestamp,
-        message,
-        type
-    };
-    downloadLog.push(logEntry);
+    downloadLog.push({ timestamp, message, type });
     updateLogDisplay();
 }
 
@@ -36,20 +31,24 @@ async function fetchGalleryInfo() {
         return;
     }
 
-    // Reset UI
     errorDisplay.style.display = 'none';
     galleryInfo.style.display = 'none';
     document.getElementById('progressSection').style.display = 'none';
+    
     fetchBtn.disabled = true;
     fetchBtn.textContent = 'Fetching...';
+    fetchBtn.style.backgroundColor = '#666'; // Explicitly change color
 
     try {
+        console.log('Sending request to /api/gallery-info with URL:', url);
         const response = await fetch('/api/gallery-info', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ url })        });
+            body: JSON.stringify({ url })
+        });
 
-        const data = await response.json();
+        console.log('Response status:', response.status);        const data = await response.json();
+        console.log('Response data:', data);
 
         if (!response.ok || !data.success) {
             throw new Error(data.error || 'Failed to fetch gallery information');
@@ -57,7 +56,6 @@ async function fetchGalleryInfo() {
 
         currentGalleryId = data.galleryId;
         
-        // Display gallery info
         document.getElementById('galleryTitle').textContent = data.title;
         document.getElementById('galleryId').textContent = data.galleryId;
         document.getElementById('pageCount').textContent = data.pageCount;
@@ -65,25 +63,23 @@ async function fetchGalleryInfo() {
         
         galleryInfo.style.display = 'block';
         addLog(`Gallery info fetched: ${data.title}`, 'success');
-        addLog(`Total pages: ${data.pageCount}`, 'info');
-        addLog(`Estimated size: ${data.estimatedSizeMB} MB`, 'info');
 
     } catch (error) {
-        showError(error.message);
-        addLog(`Error: ${error.message}`, 'error');
+        console.error('Fetch error:', error);
+        // Show error and KEEP IT VISIBLE so you can read it
+        showError(error.message || 'An unknown error occurred. Check the browser console (F12) for details.');
     } finally {
         fetchBtn.disabled = false;
         fetchBtn.textContent = 'Fetch Gallery Info';
+        fetchBtn.style.backgroundColor = ''; // Reset color
     }
 }
 
+// --- FIX: Error message NO LONGER hides automatically ---
 function showError(message) {
     const errorDisplay = document.getElementById('errorDisplay');
     errorDisplay.textContent = message;
     errorDisplay.style.display = 'block';
-    setTimeout(() => {
-        errorDisplay.style.display = 'none';
-    }, 5000);
 }
 
 function startDownload() {
@@ -96,12 +92,11 @@ function startDownload() {
     const progressSection = document.getElementById('progressSection');
     const downloadId = Math.random().toString(36).substring(2, 15);
 
-    // Reset UI    downloadLog = [];
+    downloadLog = [];
     progressSection.style.display = 'block';
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Downloading...';
-    
-    document.getElementById('progressFill').style.width = '0%';
+        document.getElementById('progressFill').style.width = '0%';
     document.getElementById('progressPercentage').textContent = '0%';
     document.getElementById('statusIndicator').textContent = '⏳ Preparing...';
     document.getElementById('progressText').textContent = 'Initializing download...';
@@ -111,29 +106,16 @@ function startDownload() {
 
     addLog('Starting download...', 'info');
 
-    // Connect to SSE progress stream
     eventSource = new EventSource(`/api/progress/${downloadId}`);
-    
-    eventSource.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        updateProgress(data);
-    };
+    eventSource.onmessage = (event) => updateProgress(JSON.parse(event.data));
+    eventSource.onerror = () => eventSource.close();
 
-    eventSource.onerror = () => {
-        console.error('SSE connection error');
-        eventSource.close();
-    };
-
-    // Start the actual download
     fetch(`/api/download/${currentGalleryId}?downloadId=${downloadId}`)
         .then(response => {
-            if (!response.ok) {
-                throw new Error('Download failed');
-            }
+            if (!response.ok) throw new Error('Download failed');
             return response.blob();
         })
         .then(blob => {
-            // Trigger browser download
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
@@ -144,8 +126,8 @@ function startDownload() {
             window.URL.revokeObjectURL(url);
             
             addLog('Download complete! File saved.', 'success');
-            
-            setTimeout(() => {                downloadBtn.disabled = false;
+            setTimeout(() => {
+                downloadBtn.disabled = false;
                 downloadBtn.textContent = '⬇️ Download as ZIP';
                 eventSource.close();
             }, 2000);
@@ -163,47 +145,36 @@ function startDownload() {
 function updateProgress(data) {
     const statusIndicator = document.getElementById('statusIndicator');
     const progressText = document.getElementById('progressText');
-    const progressFill = document.getElementById('progressFill');
-    const progressPercentage = document.getElementById('progressPercentage');
+    const progressFill = document.getElementById('progressFill');    const progressPercentage = document.getElementById('progressPercentage');
     const currentFile = document.getElementById('currentFile');
     const downloadedSize = document.getElementById('downloadedSize');
     const imageProgress = document.getElementById('imageProgress');
 
-    // Update status
     switch(data.status) {
         case 'fetching':
             statusIndicator.textContent = '⏳ Fetching...';
             progressText.textContent = data.message;
             addLog(data.message, 'info');
             break;
-            
         case 'downloading':
             statusIndicator.textContent = '⬇️ Downloading...';
             progressText.textContent = data.message;
-            
-            // Update progress bar
             if (data.total > 0) {
                 const percentage = Math.round((data.current / data.total) * 100);
                 progressFill.style.width = `${percentage}%`;
                 progressPercentage.textContent = `${percentage}%`;
             }
-            
-            // Update current file
             if (data.currentFile) {
                 currentFile.textContent = data.currentFile;
                 addLog(`Downloading: ${data.currentFile}`, 'info');
             }
-            
-            // Update size info            if (data.downloadedMB && data.totalMB) {
+            if (data.downloadedMB && data.totalMB) {
                 downloadedSize.textContent = `${data.downloadedMB} MB / ${data.totalMB} MB`;
             }
-            
-            // Update image count
             if (data.current && data.total) {
                 imageProgress.textContent = `${data.current} / ${data.total} images`;
             }
             break;
-            
         case 'archiving':
             statusIndicator.textContent = '📦 Creating ZIP...';
             progressText.textContent = data.message;
@@ -211,13 +182,11 @@ function updateProgress(data) {
             progressPercentage.textContent = '100%';
             addLog('Creating ZIP archive...', 'info');
             break;
-            
         case 'finished':
             statusIndicator.textContent = '✅ Complete!';
             progressText.textContent = 'Download finished successfully!';
             addLog('Archive created successfully!', 'success');
             break;
-            
         case 'error':
             statusIndicator.textContent = '❌ Error';
             progressText.textContent = data.message;
@@ -225,10 +194,6 @@ function updateProgress(data) {
             break;
     }
 }
-
-// Allow Enter key to fetch gallery info
 document.getElementById('urlInput').addEventListener('keypress', function(e) {
-    if (e.key === 'Enter') {
-        fetchGalleryInfo();
-    }
+    if (e.key === 'Enter') fetchGalleryInfo();
 });
