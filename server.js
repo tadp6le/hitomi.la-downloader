@@ -142,7 +142,7 @@ class AntiBlockingManager {
 
 const antiBlock = new AntiBlockingManager();
 
-// --------------- Hitomi Gallery Parser (FIXED) ---------------
+// --------------- Hitomi Gallery Parser ---------------
 class HitomiGallery {
   constructor(url) {
     this.url = url;
@@ -174,16 +174,14 @@ class HitomiGallery {
 
     const $ = cheerio.load(html);
 
-    // ---------- Extract image list ----------
-    // Look for any <script> that contains galleryinfo
+    // Extract image list
     const scripts = $('script').map((i, el) => $(el).html()).get();
     let images = [];
 
-    // Try multiple regex patterns – Hitomi uses different variable names and formats
     const patterns = [
-      /var\s+galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,      // galleryinfo
-      /var\s+galleryInfo\s*=\s*(\[[\s\S]*?\]);/i,      // galleryInfo
-      /galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,            // no var
+      /var\s+galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,
+      /var\s+galleryInfo\s*=\s*(\[[\s\S]*?\]);/i,
+      /galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,
       /galleryInfo\s*=\s*(\[[\s\S]*?\]);/i,
     ];
 
@@ -207,7 +205,7 @@ class HitomiGallery {
       throw new Error('No images found in gallery. The site might have changed its format.');
     }
 
-    // ---------- CDN subdomains ----------
+    // CDN subdomains
     let cdns = ['a', 'b', 'c', 'aa', 'ba'];
     for (const script of scripts) {
       const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i)
@@ -220,11 +218,11 @@ class HitomiGallery {
       }
     }
 
-    // ---------- Title ----------
+    // Title
     const titleTag = $('title').text().trim();
     const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
 
-    // ---------- Available formats ----------
+    // Available formats
     const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
     const total = images.length;
 
@@ -234,7 +232,7 @@ class HitomiGallery {
       formats,
       cdns,
       galleryId: this.galleryId,
-      images, // store raw image objects for later use
+      images,
     };
 
     cache.set(cacheKey, info);
@@ -243,7 +241,7 @@ class HitomiGallery {
   }
 }
 
-// --------------- Helper: construct image URL ---------------
+// Helper: construct image URL
 function constructImageUrl(galleryId, imageFile, cdns) {
   const sub = cdns[Math.floor(Math.random() * cdns.length)];
   return `https://${sub}.hitomi.la/galleries/${galleryId}/${imageFile}`;
@@ -253,12 +251,14 @@ function constructImageUrl(galleryId, imageFile, cdns) {
 app.post('/api/gallery/info', async (req, res) => {
   try {
     const { url } = req.body;
-    if (!url) return res.status(400).json({ error: 'URL required' });
+    if (!url) {
+      return res.status(400).json({ error: 'URL required' });
+    }
 
     const gallery = new HitomiGallery(url);
     const info = await gallery.getGalleryInfo();
 
-    // Estimate total size (optional, can skip if timeouts occur)
+    // Estimate total size
     const { images, cdns, galleryId } = info;
     let totalSize = 0;
     const concurrency = 5;
@@ -289,6 +289,7 @@ app.post('/api/gallery/info', async (req, res) => {
 
     const sizeEstimate = totalSize ? (totalSize / (1024*1024)).toFixed(2) + ' MB' : 'Unknown';
     log('info', `Estimated total size: ${sizeEstimate}`);
+    
     res.json({
       total: info.total,
       title: info.title,
@@ -296,14 +297,20 @@ app.post('/api/gallery/info', async (req, res) => {
       sizeEstimate,
     });
   } catch (err) {
+    console.error('Info endpoint error:', err);
     log('error', `Info error: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ 
+      error: err.message,
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
   }
 });
 
 app.post('/api/gallery/download', async (req, res) => {
   const { url, count } = req.body;
-  if (!url || !count) return res.status(400).json({ error: 'URL and count required' });
+  if (!url || !count) {
+    return res.status(400).json({ error: 'URL and count required' });
+  }
 
   try {
     const gallery = new HitomiGallery(url);
@@ -341,7 +348,6 @@ app.post('/api/gallery/download', async (req, res) => {
       const filename = `${i+1}.${ext}`;
 
       try {
-        // Get content-length for streaming
         let size = 0;
         await antiBlock.executeWithRetry(async () => {
           const headRes = await session.head(imgUrl);
@@ -368,21 +374,23 @@ app.post('/api/gallery/download', async (req, res) => {
     broadcastSSE('progress', { current: downloadCount, total: downloadCount, percent: 100 });
     broadcastSSE('complete', { filename: safeFilename });
   } catch (err) {
+    console.error('Download error:', err);
     log('error', `Download error: ${err.message}`);
-    if (!res.headersSent) res.status(500).json({ error: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
 app.get('/api/health', (req, res) => res.status(200).send('OK'));
 
-// Global error handlers for debugging
+// Global error handlers
 process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
-  process.exit(1);
 });
+
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  process.exit(1);
 });
 
 const server = app.listen(PORT, () => {
