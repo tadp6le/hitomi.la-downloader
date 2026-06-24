@@ -142,7 +142,7 @@ class AntiBlockingManager {
 
 const antiBlock = new AntiBlockingManager();
 
-// --------------- Hitomi Gallery Parser ---------------
+// --------------- Improved Hitomi Gallery Parser ---------------
 class HitomiGallery {
   constructor(url) {
     this.url = url;
@@ -152,6 +152,72 @@ class HitomiGallery {
   extractId(url) {
     const match = url.match(/(\d+)\.html$/);
     return match ? match[1] : null;
+  }
+
+  // Helper: extract a JSON array from a script using bracket counting
+  extractArrayFromScript(scriptContent, variableName) {
+    // Find the position of variable assignment
+    const regex = new RegExp(`(?:var\\s+)?${variableName}\\s*=\\s*`, 'i');
+    const match = regex.exec(scriptContent);
+    if (!match) return null;
+
+    const startIdx = match.index + match[0].length;
+    let bracketCount = 0;
+    let inString = false;
+    let escape = false;
+    let arrayStart = -1;
+    let arrayEnd = -1;
+
+    for (let i = startIdx; i < scriptContent.length; i++) {
+      const char = scriptContent[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (char === '\\') {
+        escape = true;
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        if (!inString) {
+          inString = char;
+        } else if (inString === char) {
+          inString = false;
+        }
+        continue;
+      }
+      if (inString) continue;
+
+      if (char === '[') {
+        if (bracketCount === 0) arrayStart = i;
+        bracketCount++;
+      } else if (char === ']') {
+        bracketCount--;
+        if (bracketCount === 0) {
+          arrayEnd = i;
+          break;
+        }
+      }
+    }
+
+    if (arrayStart === -1 || arrayEnd === -1) return null;
+    // Extract the array string and try to parse it
+    const arrayStr = scriptContent.substring(arrayStart, arrayEnd + 1);
+    try {
+      return JSON.parse(arrayStr);
+    } catch (e) {
+      // If JSON.parse fails, try to clean it up (remove comments, trailing commas, etc.)
+      try {
+        // Remove JavaScript comments
+        const cleaned = arrayStr.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+        // Remove trailing commas (simple approach: replace ,] with ])
+        const finalStr = cleaned.replace(/,\s*\]/g, ']');
+        return JSON.parse(finalStr);
+      } catch (e2) {
+        log('error', `Failed to parse array for ${variableName}: ${e2.message}`);
+        return null;
+      }
+    }
   }
 
   async getGalleryInfo() {
@@ -174,42 +240,54 @@ class HitomiGallery {
 
     const $ = cheerio.load(html);
 
-    // Extract image list
+    // Extract all script contents
     const scripts = $('script').map((i, el) => $(el).html()).get();
-    let images = [];
 
-    const patterns = [
-      /var\s+galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,
-      /var\s+galleryInfo\s*=\s*(\[[\s\S]*?\]);/i,
-      /galleryinfo\s*=\s*(\[[\s\S]*?\]);/i,
-      /galleryInfo\s*=\s*(\[[\s\S]*?\]);/i,
-    ];
+    let images = null;
+    let cdns = ['a', 'b', 'c', 'aa', 'ba'];
 
-    for (const script of scripts) {
-      for (const pattern of patterns) {
-        const match = script.match(pattern);
-        if (match) {
-          try {
-            images = JSON.parse(match[1]);
-            if (Array.isArray(images) && images.length > 0) break;
-          } catch (e) {
-            // continue trying other patterns
-          }
+    // Try to find galleryinfo array using multiple variable names
+    const varNames = ['galleryinfo', 'galleryInfo', 'galleryInfoList', 'images', 'imgData'];
+    for (const name of varNames) {
+      for (const script of scripts) {
+        if (!script) continue;
+        const result = this.extractArrayFromScript(script, name);
+        if (result && Array.isArray(result) && result.length > 0) {
+          images = result;
+          log('info', `Found image data using variable "${name}"`);
+          break;
         }
       }
-      if (images.length) break;
+      if (images) break;
     }
 
-    if (!images.length) {
-      log('error', 'Could not find gallery image data. Page structure may have changed.');
-      throw new Error('No images found in gallery. The site might have changed its format.');
+    // If still not found, try a generic regex search for any array of objects with "url" property
+    if (!images) {
+      log('warn', 'No specific variable found; searching for any array containing "url" in scripts');
+      for (const script of scripts) {
+        if (!script) continue;
+        // Find any array literal that contains objects with "url"
+        const arrayMatches = script.match(/\[[\s\S]*?\{[\s\S]*?url[\s\S]*?\}[\s\S]*?\]/g);
+        if (arrayMatches) {
+          for (const arrStr of arrayMatches) {
+            try {
+              const parsed = JSON.parse(arrStr);
+              if (Array.isArray(parsed) && parsed.length > 0 && parsed[0].url) {
+                images = parsed;
+                log('info', 'Found image data via generic array search');
+                break;
+              }
+            } catch (e) { /* ignore */ }
+          }
+          if (images) break;
+        }
+      }
     }
 
-    // CDN subdomains
-    let cdns = ['a', 'b', 'c', 'aa', 'ba'];
+    // Try to find cdns
     for (const script of scripts) {
-      const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i)
-             || script.match(/cdns\s*=\s*(\[[^\]]*\])/i);
+      if (!script) continue;
+      const m = script.match(/var\s+cdns\s*=\s*(\[[^\]]*\])/i) || script.match(/cdns\s*=\s*(\[[^\]]*\])/i);
       if (m) {
         try {
           cdns = JSON.parse(m[1]);
@@ -218,11 +296,18 @@ class HitomiGallery {
       }
     }
 
+    if (!images || !images.length) {
+      // Log a snippet of the first script for debugging
+      const firstScript = scripts.find(s => s && s.length > 0);
+      log('error', `No images found. First script snippet: ${firstScript ? firstScript.substring(0, 500) : 'No scripts'}`);
+      throw new Error('No images found in gallery. The site might have changed its format. Please check the logs.');
+    }
+
     // Title
     const titleTag = $('title').text().trim();
     const title = titleTag.replace(/^Hitomi\.la\s*[-–—]\s*/i, '') || `Gallery ${this.galleryId}`;
 
-    // Available formats
+    // Formats
     const formats = [...new Set(images.map(img => img.url.split('.').pop().toLowerCase()))];
     const total = images.length;
 
